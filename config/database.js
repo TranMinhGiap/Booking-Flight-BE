@@ -6,7 +6,8 @@ module.exports.connect = async () => {
     await mongoose.connect(process.env.MONGO_URL);
     console.log("Connect Success");
   } catch (error) {
-    console.log("Connect Error !")
+    console.log("Connect Error !");
+    throw error;
   }
 }
 
