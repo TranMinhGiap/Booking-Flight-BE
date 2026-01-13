@@ -1,5 +1,6 @@
 const authRoutes = require('./auth.route');
 const airportRoutes = require('./airport.route');
+const seatClassRoutes = require('./seatClass.route');
 
 module.exports = (app) => {
   // Version api
@@ -8,4 +9,6 @@ module.exports = (app) => {
   app.use(version + '/auth', authRoutes);
 
   app.use(version + '/airports', airportRoutes);
+
+  app.use(version + '/seat-classes', seatClassRoutes);
 }
