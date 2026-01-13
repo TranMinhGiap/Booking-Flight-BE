@@ -10,9 +10,11 @@ const corsOptions = {
     // cho phép request không có origin (Postman, curl, server-to-server)
     if (!origin) return cb(null, true);
 
-    if (allowedOrigins.includes(origin)) return cb(null, true);
+    const allow = allowedOrigins.includes(origin);
 
-    return cb(new Error(`CORS blocked: ${origin}`));
+    if (!allow) console.warn("[CORS] Blocked origin:", origin);
+
+    cb(null, allow);
   },
   credentials: true, // bật nếu FE gửi cookie / Authorization cần chia sẻ
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
