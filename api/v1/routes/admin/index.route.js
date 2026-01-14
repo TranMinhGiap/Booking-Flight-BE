@@ -1,6 +1,7 @@
 const authRoutes = require('./auth.route');
 const airlineRoutes = require('./airline.route');
 const flightRoutes = require('./flight.route');
+const airplaneRoutes = require('./airplane.route');
 
 module.exports = (app) => {
   // Version api
@@ -11,4 +12,6 @@ module.exports = (app) => {
   app.use(version + '/airlines', airlineRoutes);
 
   app.use(version + '/flights', flightRoutes);
+
+  app.use(version + '/airplanes', airplaneRoutes);
 }
