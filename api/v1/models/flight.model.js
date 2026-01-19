@@ -47,18 +47,16 @@ const FlightSchema = new mongoose.Schema(
 );
 
 // Không cho departure = arrival
-FlightSchema.pre("validate", function (next) {
+FlightSchema.pre("validate", function () {
   if (
     this.departureAirportId &&
     this.arrivalAirportId &&
     this.departureAirportId.toString() === this.arrivalAirportId.toString()
   ) {
-    return next(
-      new Error("departureAirportId must be different from arrivalAirportId")
-    );
+    throw new Error("departureAirportId must be different from arrivalAirportId");
   }
-  next();
 });
+
 
 // Index phục vụ query tuyến bay nhanh
 FlightSchema.index({ departureAirportId: 1, arrivalAirportId: 1, airlineId: 1 });
