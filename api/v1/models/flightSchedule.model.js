@@ -43,11 +43,10 @@ const FlightScheduleSchema = new mongoose.Schema(
 );
 
 // Validate arrival > departure
-FlightScheduleSchema.pre("validate", function (next) {
+FlightScheduleSchema.pre("validate", function () {
   if (this.departureTime && this.arrivalTime && this.arrivalTime <= this.departureTime) {
-    return next(new Error("arrivalTime must be greater than departureTime"));
+    throw new Error("arrivalTime must be greater than departureTime");
   }
-  next();
 });
 
 // Virtual duration (phút và giờ, tiện cho API/FE)
