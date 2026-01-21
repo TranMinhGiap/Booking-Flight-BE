@@ -3,6 +3,7 @@ const airlineRoutes = require('./airline.route');
 const flightRoutes = require('./flight.route');
 const airplaneRoutes = require('./airplane.route');
 const seatLayout = require('./seatLayout.route');
+const seatClass = require('./seatClass.route');
 
 module.exports = (app) => {
   // Version api
@@ -17,4 +18,6 @@ module.exports = (app) => {
   app.use(version + '/airplanes', airplaneRoutes);
 
   app.use(version + '/seat-layouts', seatLayout);
+
+  app.use(version + '/seat-classes', seatClass);
 }
