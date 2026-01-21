@@ -2,6 +2,7 @@ const sendResponseHelper = require("../../../../helpers/sendResponse.helper");
 const { dayRangeByTimezone } = require("../../../../utils/dayRangeByTimezone.util");
 const paginationHelper = require("../../../../helpers/objectPagination.helper");
 const { buildRange } = require("../../../../helpers/buildRange.helper");
+const { buildSortSpec } = require("../../../../helpers/buildSortSpec.helper");
 
 const FlightSchedule = require("../../models/flightSchedule.model");
 const Airport = require("../../models/airport.model");
@@ -26,12 +27,15 @@ module.exports.index = async (req, res) => {
       maxPrice,
       minDuration,
       maxDuration,
+      sort,
     } = req.query;
 
     const adultsN = Number(adults || 0);
     const childrenN = Number(children || 0);
     const infantsN = Number(infants || 0);
     const pax = adultsN + childrenN; // cần ghế cho người lớn + trẻ em
+
+    const sortSpec = buildSortSpec(sort);
 
     // 1) Validate airports
     const [fromAirport, toAirport] = await Promise.all([
@@ -289,7 +293,7 @@ module.exports.index = async (req, res) => {
           // ROWS: áp airline filter
           rows: [
             ...(matchAirlineFilter ? [{ $match: matchAirlineFilter }] : []),
-            { $sort: { departureTime: 1 } },
+            { $sort: sortSpec },
             { $skip: pagination.skip },
             { $limit: pagination.limit },
 
