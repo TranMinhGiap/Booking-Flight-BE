@@ -3,6 +3,7 @@ const { dayRangeByTimezone } = require("../../../../utils/dayRangeByTimezone.uti
 const paginationHelper = require("../../../../helpers/objectPagination.helper");
 const { buildRange } = require("../../../../helpers/buildRange.helper");
 const { buildSortSpec } = require("../../../../helpers/buildSortSpec.helper");
+const { parseWindows } = require("../../../../helpers/parseWindows.helper");
 
 const FlightSchedule = require("../../models/flightSchedule.model");
 const Airport = require("../../models/airport.model");
@@ -28,6 +29,8 @@ module.exports.index = async (req, res) => {
       minDuration,
       maxDuration,
       sort,
+      depWindows,
+      arrWindows,
     } = req.query;
 
     const adultsN = Number(adults || 0);
@@ -78,6 +81,17 @@ module.exports.index = async (req, res) => {
     const minDurationN = Number(minDuration);
     const maxDurationN = Number(maxDuration);
 
+    const depWin = parseWindows(depWindows);
+    const arrWin = parseWindows(arrWindows);
+
+    const depOr = depWin.map(({ start, end }) => ({
+      depMinuteOfDay: { $gte: start, $lt: end },
+    }));
+
+    const arrOr = arrWin.map(({ start, end }) => ({
+      arrMinuteOfDay: { $gte: start, $lt: end },
+    }));
+
     const airlineCodes = String(airlines || "")
       .split(",")
       .map((s) => s.trim().toUpperCase())
@@ -113,17 +127,24 @@ module.exports.index = async (req, res) => {
       }
     }
 
-    // ====== TÁCH FILTER: non-airline vs airline ======
-    const matchNonAirlineFilters = {};
-    const priceQ = buildRange(minPriceN, maxPriceN);
-    if (priceQ) matchNonAirlineFilters.totalAdult = priceQ;
-
-    const durQ = buildRange(minDurationN, maxDurationN);
-    if (durQ) matchNonAirlineFilters.durationMinutes = durQ;
-
     const matchAirlineFilter = airlineIds.length
       ? { airlineId: { $in: airlineIds } }
       : null;
+
+    // ====== TÁCH FILTER: non-airline vs airline ======
+    const andFilters = [];
+
+    const priceQ = buildRange(minPriceN, maxPriceN);
+    if (priceQ) andFilters.push({ totalAdult: priceQ });
+
+    const durQ = buildRange(minDurationN, maxDurationN);
+    if (durQ) andFilters.push({ durationMinutes: durQ });
+
+    // depWindows / arrWindows (lọc theo khung giờ)
+    if (depOr.length) andFilters.push({ $or: depOr });
+    if (arrOr.length) andFilters.push({ $or: arrOr });
+
+    const matchNonAirlineFilters = andFilters.length ? { $and: andFilters } : {};
 
     /**
      * baseCore: chỉ filter core (date/route/seatClass/pax/available) + tính fields
@@ -265,6 +286,32 @@ module.exports.index = async (req, res) => {
           flightNumber: "$flight.flightNumber",
         },
       },
+      {
+        $addFields: {
+          _depParts: {
+            $dateToParts: {
+              date: "$departureTime",
+              timezone: fromAirport.timezone || "Asia/Ho_Chi_Minh",
+            },
+          },
+          _arrParts: {
+            $dateToParts: {
+              date: "$arrivalTime",
+              timezone: toAirport.timezone || "Asia/Ho_Chi_Minh",
+            },
+          },
+        },
+      },
+      {
+        $addFields: {
+          depMinuteOfDay: {
+            $add: [{ $multiply: ["$_depParts.hour", 60] }, "$_depParts.minute"],
+          },
+          arrMinuteOfDay: {
+            $add: [{ $multiply: ["$_arrParts.hour", 60] }, "$_arrParts.minute"],
+          },
+        },
+      },
 
       // đủ ghế
       { $match: { availableCount: { $gte: pax } } },
@@ -388,7 +435,7 @@ module.exports.index = async (req, res) => {
             },
           ],
 
-          // ✅ airlinesFacet: KHÔNG matchAirlineFilter => luôn đủ option theo các filter khác
+          // airlinesFacet: KHÔNG matchAirlineFilter => luôn đủ option theo các filter khác
           airlinesFacet: [
             {
               $group: {
