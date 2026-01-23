@@ -5,7 +5,302 @@ const FlightSchedule = require("../../models/flightSchedule.model");
 const FlightFare = require("../../models/flightFare.model");
 const { addMinutes } = require("../../../../helpers/addMinutes.helper");
 const { buildGuestId } = require("../../../../helpers/buildGuestId.helper");
+const { sha256 } = require('../../../../helpers/sha256.helper')
 
+// [GET] /api/v1/booking-sessions/:publicId
+module.exports.index = async (req, res) => {
+  try {
+
+    const { publicId } = req.params;
+
+    if (!publicId || typeof publicId !== "string") {
+      return sendResponseHelper.errorResponse(res, {
+        statusCode: 400,
+        errorCode: "publicId is required",
+      });
+    }
+
+    const now = new Date();
+
+    // ===== 1) Load minimal session for auth verify =====
+    const sessionAuth = await BookingSession.findOne({ publicId })
+      .select("publicId ownerType accountId guestId status expiresAt")
+      .select("+sessionSecretHash")
+      .lean();
+
+    if (!sessionAuth) {
+      return sendResponseHelper.errorResponse(res, {
+        statusCode: 404,
+        errorCode: "BookingSession not found",
+      });
+    }
+
+    if (sessionAuth.expiresAt && new Date(sessionAuth.expiresAt) <= now) {
+      return sendResponseHelper.errorResponse(res, {
+        statusCode: 410,
+        errorCode: "BookingSession expired",
+      });
+    }
+
+    // status expired/cancelled?
+    if (["EXPIRED", "CANCELLED"].includes(sessionAuth.status)) {
+      return sendResponseHelper.errorResponse(res, {
+        statusCode: 410,
+        errorCode: `BookingSession ${String(sessionAuth.status).toLowerCase()}`,
+      });
+    }
+
+    // ===== 2) Verify owner =====
+    
+    if (sessionAuth.ownerType === "ACCOUNT") {
+      const userId = req.user?._id;
+      if (!userId) {
+        return sendResponseHelper.errorResponse(res, {
+          statusCode: 401,
+          errorCode: "Unauthorized",
+        });
+      }
+      if (String(userId) !== String(sessionAuth.accountId)) {
+        return sendResponseHelper.errorResponse(res, {
+          statusCode: 403,
+          errorCode: "Forbidden",
+        });
+      }
+    } else {
+      // GUEST
+      const guestId = req.cookies?.guest_id;
+      const bsToken = req.cookies?.bs_token;
+
+      if (!guestId || !bsToken) {
+        return sendResponseHelper.errorResponse(res, {
+          statusCode: 401,
+          errorCode: "Unauthorized (missing guest cookies)",
+        });
+      }
+
+      if (String(sessionAuth.guestId || "") !== String(guestId)) {
+        return sendResponseHelper.errorResponse(res, {
+          statusCode: 403,
+          errorCode: "Forbidden (guestId mismatch)",
+        });
+      }
+
+      const tokenHash = sha256(bsToken);
+      if (tokenHash !== sessionAuth.sessionSecretHash) {
+        return sendResponseHelper.errorResponse(res, {
+          statusCode: 403,
+          errorCode: "Forbidden (invalid session secret)",
+        });
+      }
+    }
+
+    // ===== 3) Fetch full session with joins (aggregate) =====
+    const pipeline = [
+      { $match: { publicId } },
+
+      // unwind segments + lấy luôn index
+      { $unwind: { path: "$segments", includeArrayIndex: "_idx" } },
+
+      // join FlightSchedule
+      {
+        $lookup: {
+          from: "flight_schedules",
+          localField: "segments.flightScheduleId",
+          foreignField: "_id",
+          as: "fs",
+        },
+      },
+      { $unwind: "$fs" },
+      { $match: { "fs.deleted": false } },
+
+      // join Flight
+      {
+        $lookup: {
+          from: "flights",
+          localField: "fs.flightId",
+          foreignField: "_id",
+          as: "flight",
+        },
+      },
+      { $unwind: "$flight" },
+      { $match: { "flight.deleted": false, "flight.status": "active" } },
+
+      // join Airline
+      {
+        $lookup: {
+          from: "airlines",
+          localField: "flight.airlineId",
+          foreignField: "_id",
+          as: "airline",
+        },
+      },
+      { $unwind: "$airline" },
+      { $match: { "airline.deleted": false, "airline.status": "active" } },
+
+      // join Airports
+      {
+        $lookup: {
+          from: "airports",
+          localField: "flight.departureAirportId",
+          foreignField: "_id",
+          as: "fromAirport",
+        },
+      },
+      { $unwind: "$fromAirport" },
+      { $match: { "fromAirport.deleted": false, "fromAirport.status": "active" } },
+
+      {
+        $lookup: {
+          from: "airports",
+          localField: "flight.arrivalAirportId",
+          foreignField: "_id",
+          as: "toAirport",
+        },
+      },
+      { $unwind: "$toAirport" },
+      { $match: { "toAirport.deleted": false, "toAirport.status": "active" } },
+
+      // join SeatClass
+      {
+        $lookup: {
+          from: "seat_classes",
+          localField: "segments.seatClassId",
+          foreignField: "_id",
+          as: "seatClass",
+        },
+      },
+      { $unwind: "$seatClass" },
+      { $match: { "seatClass.deleted": false, "seatClass.status": "active" } },
+
+      // build segment payload
+      {
+        $addFields: {
+          _segmentOut: {
+            _idx: "$_idx",
+            direction: "$segments.direction",
+
+            seatClass: {
+              id: "$seatClass._id",
+              code: "$segments.seatClassCode",
+              name: "$seatClass.className",
+            },
+
+            selectedSeatIds: "$segments.selectedSeatIds",
+            priceSnapshot: "$segments.priceSnapshot",
+
+            flightSchedule: {
+              id: "$fs._id",
+              departureAt: "$fs.departureTime",
+              arrivalAt: "$fs.arrivalTime",
+              status: "$fs.status",
+              airplaneId: "$fs.airplaneId",
+            },
+
+            flight: {
+              id: "$flight._id",
+              flightNumber: "$flight.flightNumber",
+              durationMinutes: "$flight.durationMinutes",
+
+              airline: {
+                id: "$airline._id",
+                code: "$airline.iataCode",
+                name: "$airline.name",
+                logoUrl: "$airline.logoUrl",
+              },
+
+              from: {
+                id: "$fromAirport._id",
+                code: "$fromAirport.iataCode",
+                name: "$fromAirport.name",
+                city: "$fromAirport.city",
+                timeZone: "$fromAirport.timezone",
+              },
+
+              to: {
+                id: "$toAirport._id",
+                code: "$toAirport.iataCode",
+                name: "$toAirport.name",
+                city: "$toAirport.city",
+                timeZone: "$toAirport.timezone",
+              },
+            },
+          },
+        },
+      },
+
+      // regroup về 1 document
+      {
+        $group: {
+          _id: "$_id",
+          publicId: { $first: "$publicId" },
+          ownerType: { $first: "$ownerType" },
+          accountId: { $first: "$accountId" },
+          guestId: { $first: "$guestId" },
+          tripType: { $first: "$tripType" },
+          passengersCount: { $first: "$passengersCount" },
+          passengers: { $first: "$passengers" },
+          grandTotalSnapshot: { $first: "$grandTotalSnapshot" },
+          status: { $first: "$status" },
+          expiresAt: { $first: "$expiresAt" },
+          lastActivityAt: { $first: "$lastActivityAt" },
+          createdAt: { $first: "$createdAt" },
+          updatedAt: { $first: "$updatedAt" },
+          segments: { $push: "$_segmentOut" },
+        },
+      },
+
+      // trả payload
+      {
+        $project: {
+          _id: 0,
+          publicId: 1,
+          ownerType: 1,
+          accountId: 1,
+          guestId: 1,
+          tripType: 1,
+          passengersCount: 1,
+          passengers: 1,
+          grandTotalSnapshot: 1,
+          status: 1,
+          expiresAt: 1,
+          lastActivityAt: 1,
+          createdAt: 1,
+          updatedAt: 1,
+          segments: 1,
+        },
+      },
+    ];
+
+    const arr = await BookingSession.aggregate(pipeline);
+    const out = arr?.[0];
+
+    if (!out) {
+      return sendResponseHelper.errorResponse(res, {
+        statusCode: 404,
+        errorCode: "BookingSession not found (invalid itinerary data)",
+      });
+    }
+
+    out.segments = (out.segments || [])
+      .sort((a, b) => Number(a._idx || 0) - Number(b._idx || 0))
+      .map(({ _idx, ...rest }) => rest);
+
+    // ===== 4) remaining seconds for FE countdown =====
+    const remainingMs = out.expiresAt ? new Date(out.expiresAt).getTime() - now.getTime() : 0;
+
+    return sendResponseHelper.successResponse(res, {
+      data: {
+        ...out,
+        meta: {
+          serverTime: now.toISOString(),
+          remainingSeconds: Math.max(0, Math.floor(remainingMs / 1000)),
+        },
+      },
+    });
+  } catch (error) {
+    return sendResponseHelper.errorResponse(res, { errorCode: error.message });
+  }
+};
 // [POST] /api/v1/booking-sessions/create
 module.exports.create = async (req, res) => {
   try {
