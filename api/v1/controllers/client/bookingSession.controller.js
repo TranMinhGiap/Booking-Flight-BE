@@ -10,7 +10,6 @@ const { sha256 } = require('../../../../helpers/sha256.helper')
 // [GET] /api/v1/booking-sessions/:publicId
 module.exports.index = async (req, res) => {
   try {
-
     const { publicId } = req.params;
 
     if (!publicId || typeof publicId !== "string") {
@@ -42,7 +41,6 @@ module.exports.index = async (req, res) => {
       });
     }
 
-    // status expired/cancelled?
     if (["EXPIRED", "CANCELLED"].includes(sessionAuth.status)) {
       return sendResponseHelper.errorResponse(res, {
         statusCode: 410,
@@ -51,7 +49,6 @@ module.exports.index = async (req, res) => {
     }
 
     // ===== 2) Verify owner =====
-    
     if (sessionAuth.ownerType === "ACCOUNT") {
       const userId = req.user?._id;
       if (!userId) {
@@ -98,7 +95,7 @@ module.exports.index = async (req, res) => {
     const pipeline = [
       { $match: { publicId } },
 
-      // unwind segments + lấy luôn index
+      // unwind segments + include index (preserve order)
       { $unwind: { path: "$segments", includeArrayIndex: "_idx" } },
 
       // join FlightSchedule
@@ -137,7 +134,7 @@ module.exports.index = async (req, res) => {
       { $unwind: "$airline" },
       { $match: { "airline.deleted": false, "airline.status": "active" } },
 
-      // join Airports
+      // join Airports (from)
       {
         $lookup: {
           from: "airports",
@@ -149,6 +146,7 @@ module.exports.index = async (req, res) => {
       { $unwind: "$fromAirport" },
       { $match: { "fromAirport.deleted": false, "fromAirport.status": "active" } },
 
+      // join Airports (to)
       {
         $lookup: {
           from: "airports",
@@ -172,7 +170,7 @@ module.exports.index = async (req, res) => {
       { $unwind: "$seatClass" },
       { $match: { "seatClass.deleted": false, "seatClass.status": "active" } },
 
-      // build segment payload
+      // build segment payload (UPDATED for new model)
       {
         $addFields: {
           _segmentOut: {
@@ -185,7 +183,10 @@ module.exports.index = async (req, res) => {
               name: "$seatClass.className",
             },
 
-            selectedSeatIds: "$segments.selectedSeatIds",
+            seatAssignments: "$segments.seatAssignments",
+            seatTotalSnapshot: "$segments.seatTotalSnapshot",
+
+            // base fare snapshot (without seat fee)
             priceSnapshot: "$segments.priceSnapshot",
 
             flightSchedule: {
@@ -228,7 +229,7 @@ module.exports.index = async (req, res) => {
         },
       },
 
-      // regroup về 1 document
+      // regroup back to 1 doc
       {
         $group: {
           _id: "$_id",
@@ -239,6 +240,7 @@ module.exports.index = async (req, res) => {
           tripType: { $first: "$tripType" },
           passengersCount: { $first: "$passengersCount" },
           passengers: { $first: "$passengers" },
+          contactInfo: { $first: "$contactInfo" },
           grandTotalSnapshot: { $first: "$grandTotalSnapshot" },
           status: { $first: "$status" },
           expiresAt: { $first: "$expiresAt" },
@@ -249,7 +251,7 @@ module.exports.index = async (req, res) => {
         },
       },
 
-      // trả payload
+      // final payload
       {
         $project: {
           _id: 0,
@@ -260,6 +262,7 @@ module.exports.index = async (req, res) => {
           tripType: 1,
           passengersCount: 1,
           passengers: 1,
+          contactInfo: 1,
           grandTotalSnapshot: 1,
           status: 1,
           expiresAt: 1,
@@ -281,12 +284,15 @@ module.exports.index = async (req, res) => {
       });
     }
 
+    // sort segments and drop _idx
     out.segments = (out.segments || [])
       .sort((a, b) => Number(a._idx || 0) - Number(b._idx || 0))
       .map(({ _idx, ...rest }) => rest);
 
     // ===== 4) remaining seconds for FE countdown =====
-    const remainingMs = out.expiresAt ? new Date(out.expiresAt).getTime() - now.getTime() : 0;
+    const remainingMs = out.expiresAt
+      ? new Date(out.expiresAt).getTime() - now.getTime()
+      : 0;
 
     return sendResponseHelper.successResponse(res, {
       data: {
@@ -358,7 +364,6 @@ module.exports.create = async (req, res) => {
 
     // 3) owner: account hoặc guest
     const accountId = req.user?._id || null;
-
     const guestIdFromCookie = req.cookies?.guest_id;
     const guestId = accountId ? null : (guestIdFromCookie || buildGuestId());
 
@@ -431,24 +436,26 @@ module.exports.create = async (req, res) => {
       }
 
       const adultUnit = Number(fare.basePrice || 0) + Number(fare.tax || 0) + Number(fare.serviceFee || 0);
-      // Sau này thêm giá cho từng thành viên sau
+      // Sau này thêm giá thành viên sau
       const childUnit = Math.round(adultUnit * 0.75);
       const infantUnit = Math.round(adultUnit * 0.1);
 
       const total = pax.adults * adultUnit + pax.children * childUnit + pax.infants * infantUnit;
 
-      // accumulate grand total (cộng theo chặng)
-      grand.adult += adultUnit;
-      grand.child += childUnit;
-      grand.infant += infantUnit;
+      //  grand snapshot theo TỔNG tiền từng loại pax
+      grand.adult += pax.adults * adultUnit;
+      grand.child += pax.children * childUnit;
+      grand.infant += pax.infants * infantUnit;
       grand.total += total;
 
       builtSegments.push({
-        direction: seg.direction,                 // OUTBOUND / INBOUND
+        direction: seg.direction,        // OUTBOUND / INBOUND
         flightScheduleId: fs._id,
-        seatClassCode,                            // lưu snapshot code
-        seatClassId: seatClassDoc._id,            // lưu id
-        selectedSeatIds: [],
+        seatClassCode,                   // snapshot code
+        seatClassId: seatClassDoc._id,   // id
+        seatAssignments: [],
+        seatTotalSnapshot: { currency: "VND", total: 0 },
+        // base fare snapshot (not include seat fee)
         priceSnapshot: {
           currency: "VND",
           adult: adultUnit,
@@ -472,7 +479,7 @@ module.exports.create = async (req, res) => {
       tripType: normalizedTripType,
       segments: builtSegments,
       passengersCount: pax,
-
+      contactInfo: {},
       grandTotalSnapshot: {
         currency: grand.currency,
         adult: grand.adult,

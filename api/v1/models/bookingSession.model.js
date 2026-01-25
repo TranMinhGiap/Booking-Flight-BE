@@ -13,6 +13,25 @@ function sha256(input) {
 }
 
 /**
+ * ContactInfo snapshot schema
+ */
+const ContactInfoSchema = new Schema(
+  {
+    fullName: { type: String, trim: true },   // hoặc firstName/lastName
+    firstName: { type: String, trim: true },
+    lastName: { type: String, trim: true },
+
+    email: { type: String, trim: true, lowercase: true },
+    phone: { type: String, trim: true },
+    countryCode: { type: String, default: "+84" },
+
+    // optional
+    note: { type: String, trim: true },
+  },
+  { _id: false }
+);
+
+/**
  * Price snapshot schema (reuse)
  */
 const PriceSnapshotSchema = new Schema(
@@ -22,6 +41,30 @@ const PriceSnapshotSchema = new Schema(
     child: { type: Number, default: 0, min: 0 },
     infant: { type: Number, default: 0, min: 0 },
     total: { type: Number, default: 0, min: 0 },
+  },
+  { _id: false }
+);
+
+/**
+ * Money snapshot schema (reuse)
+ */
+const MoneySnapshotSchema = new Schema(
+  {
+    currency: { type: String, default: "VND" },
+    total: { type: Number, default: 0, min: 0 },
+  },
+  { _id: false }
+);
+
+/**
+ * SeatAssignment (Lưu chi tiết ghế cho từng hành khách)
+ */
+const SeatAssignmentSchema = new Schema(
+  {
+    paxIndex: { type: Number, required: true, min: 0 },
+    seatId: { type: Schema.Types.ObjectId, ref: "FlightSeat", required: true },
+    seatNumber: { type: String, required: true, trim: true },
+    seatPriceSnapshot: { type: MoneySnapshotSchema, default: () => ({ currency: "VND", total: 0 }) },
   },
   { _id: false }
 );
@@ -52,14 +95,20 @@ const SegmentSchema = new Schema(
       required: true,
     },
 
+    // mapping paxIndex -> seatId (hydration FE dựa vào đây)
+    seatAssignments: { type: [SeatAssignmentSchema], default: [] },
+
     /**
      * Ghế chọn riêng từng chặng.
      * Không dùng unique:true ở đây (không enforce đúng trên array).
      * Enforce seat hold phải làm ở collection flight_seats bằng update atomic.
      */
-    selectedSeatIds: [{ type: Schema.Types.ObjectId, ref: "FlightSeat" }],
 
+    // snapshot giá vé base (không gồm seat fee)
     priceSnapshot: { type: PriceSnapshotSchema, default: () => ({}) },
+
+    // snapshot phí chọn ghế của segment
+    seatTotalSnapshot: { type: MoneySnapshotSchema, default: () => ({ currency: "VND", total: 0 }) },
   },
   { _id: false }
 );
@@ -83,6 +132,9 @@ const BookingSessionSchema = new Schema(
       default: "GUEST",
       index: true,
     },
+
+    // Contact Info
+    contactInfo: { type: ContactInfoSchema, default: () => ({}) },
 
     accountId: { type: Schema.Types.ObjectId, ref: "Account", index: true },
 
@@ -220,6 +272,34 @@ BookingSessionSchema.pre("validate", function () {
 
   // last activity
   if (!this.lastActivityAt) this.lastActivityAt = new Date();
+
+  // paxIndex không vượt số pax cần ghế, không trùng paxIndex trong 1 segment, không trùng seatId
+  const maxSeatPax = (pc.adults || 0) + (pc.children || 0); // infants excluded
+
+  for (const seg of this.segments || []) {
+    const arr = seg.seatAssignments || [];
+
+    // paxIndex range
+    for (const a of arr) {
+      if (a.paxIndex < 0 || a.paxIndex >= maxSeatPax) {
+        throw new Error(`Invalid paxIndex ${a.paxIndex} for seatAssignments`);
+      }
+    }
+
+    // unique paxIndex & seatId
+    const paxSet = new Set();
+    const seatSet = new Set();
+    for (const a of arr) {
+      if (paxSet.has(a.paxIndex)) throw new Error("Duplicate paxIndex in seatAssignments");
+      paxSet.add(a.paxIndex);
+
+      const sid = a.seatId ? String(a.seatId) : "";
+      if (!sid) throw new Error("seatId is required in seatAssignments");
+
+      if (seatSet.has(sid)) throw new Error("Duplicate seatId in seatAssignments");
+      seatSet.add(sid);
+    }
+  }
 });
 
 /**
@@ -252,6 +332,11 @@ BookingSessionSchema.methods.recomputeGrandTotal = function () {
     sum.child += Number(p.child || 0);
     sum.infant += Number(p.infant || 0);
     sum.total += Number(p.total || 0);
+
+    const seat = s.seatTotalSnapshot || {};
+    // seat fee thường chỉ có "total"
+    if (seat.currency) sum.currency = seat.currency;
+    sum.total += Number(seat.total || 0);
   }
 
   this.grandTotalSnapshot = sum;
