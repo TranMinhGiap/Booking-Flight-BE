@@ -4,6 +4,13 @@ const SeatLayoutSchema = new mongoose.Schema(
   {
     airplaneId: { type: mongoose.Schema.Types.ObjectId, ref: "Airplane", required: true, index: true },
     seatClassId: { type: mongoose.Schema.Types.ObjectId, ref: "SeatClass", required: true, index: true },
+    seatTypeId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SeatType",
+      required: true,
+      index: true,
+    },
+    seatTypeCode: { type: String, trim: true, uppercase: true },
     seatRow: { type: Number, required: true, min: 1 },
     seatColumn: { type: String, required: true, uppercase: true, match: /^[A-Z]+$/, trim: true },
     isWindow: { type: Boolean, default: false },
