@@ -5,7 +5,11 @@ const FlightSchedule = require("../../models/flightSchedule.model");
 const FlightFare = require("../../models/flightFare.model");
 const { addMinutes } = require("../../../../helpers/addMinutes.helper");
 const { buildGuestId } = require("../../../../helpers/buildGuestId.helper");
-const { sha256 } = require('../../../../helpers/sha256.helper')
+const { sha256 } = require('../../../../helpers/sha256.helper');
+const mongoose = require("mongoose");
+const FlightSeat = require("../../models/flightSeat.model");
+const SeatLayout = require("../../models/seatLayout.model");
+const SeatType = require("../../models/seatType.model");
 
 // [GET] /api/v1/booking-sessions/:publicId
 module.exports.index = async (req, res) => {
@@ -523,3 +527,288 @@ module.exports.create = async (req, res) => {
     return sendResponseHelper.errorResponse(res, { errorCode: error.message });
   }
 };
+// [PATCH] /api/v1/booking-sessions/:publicId/seat-assignments
+module.exports.patchSeatAssignments = async (req, res) => {
+  function assertValidDirection(direction) {
+    return direction === "OUTBOUND" || direction === "INBOUND";
+  }
+  function calcSeatPriceVND({ seatTypeBasePrice = 0, priceAdjustment = 0 }) {
+    return Number(seatTypeBasePrice || 0) + Number(priceAdjustment || 0);
+  }
+  const mongoSession = await mongoose.startSession();
+  try {
+    // body: { direction, paxIndex, seatId }
+    const { publicId } = req.params;
+    const { direction, paxIndex, seatId } = req.body || {};
+
+    if (!publicId) {
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "publicId is required" });
+    }
+    if (!assertValidDirection(direction)) {
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Invalid direction" });
+    }
+    const paxIdx = Number(paxIndex);
+    if (!Number.isInteger(paxIdx) || paxIdx < 0) {
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Invalid paxIndex" });
+    }
+
+    const now = new Date();
+    const ttlMin = Number(process.env.BOOKING_SESSION_TTL_MINUTES || 15);
+
+    let outSession = null;
+
+    await mongoSession.withTransaction(async () => {
+      // 1) Load session (must include sessionSecretHash)
+      const bs = await BookingSession.findOne({ publicId })
+        .select("+sessionSecretHash")
+        .session(mongoSession);
+
+      if (!bs) {
+        throw Object.assign(new Error("BookingSession not found"), { _http: 404 });
+      }
+
+      if (bs.expiresAt && new Date(bs.expiresAt) <= now) {
+        throw Object.assign(new Error("BookingSession expired"), { _http: 410 });
+      }
+      if (["EXPIRED", "CANCELLED"].includes(bs.status)) {
+        throw Object.assign(new Error(`BookingSession ${String(bs.status).toLowerCase()}`), { _http: 410 });
+      }
+
+      // 2) Verify owner (giống GET /booking-sessions/:publicId)
+      if (bs.ownerType === "ACCOUNT") {
+        const userId = req.user?._id;
+        if (!userId) throw Object.assign(new Error("Unauthorized"), { _http: 401 });
+        if (String(userId) !== String(bs.accountId)) throw Object.assign(new Error("Forbidden"), { _http: 403 });
+      } else {
+        const guestId = req.cookies?.guest_id;
+        const bsToken = req.cookies?.bs_token;
+
+        if (!guestId || !bsToken) throw Object.assign(new Error("Unauthorized (missing guest cookies)"), { _http: 401 });
+        if (String(bs.guestId || "") !== String(guestId)) throw Object.assign(new Error("Forbidden (guestId mismatch)"), { _http: 403 });
+
+        const tokenHash = sha256(bsToken);
+        if (tokenHash !== bs.sessionSecretHash) throw Object.assign(new Error("Forbidden (invalid session secret)"), { _http: 403 });
+      }
+
+      // 3) Validate paxIndex range (adult + child need seat)
+      const pc = bs.passengersCount || {};
+      const maxSeatPax = Number(pc.adults || 0) + Number(pc.children || 0);
+      if (paxIdx >= maxSeatPax) {
+        throw Object.assign(new Error("paxIndex out of range"), { _http: 400 });
+      }
+
+      // 4) Extend expiresAt on every activity (để user thao tác không bị timeout)
+      const newExpiresAt = addMinutes(now, ttlMin);
+      bs.expiresAt = newExpiresAt;
+      bs.lastActivityAt = now;
+
+      // Update all seats held by this session -> extend blockedUntil
+      await FlightSeat.updateMany(
+        { blockedBySessionId: bs._id, status: "held", deleted: false },
+        { $set: { blockedUntil: newExpiresAt } },
+        { session: mongoSession }
+      );
+
+      // 5) Locate segment
+      const seg = (bs.segments || []).find((s) => s.direction === direction);
+      if (!seg) {
+        throw Object.assign(new Error("Segment not found for direction"), { _http: 400 });
+      }
+
+      // 6) Find current assignment of this pax
+      const prevAssignIdx = (seg.seatAssignments || []).findIndex((a) => Number(a.paxIndex) === paxIdx);
+      const prevAssign = prevAssignIdx >= 0 ? seg.seatAssignments[prevAssignIdx] : null;
+      const prevSeatId = prevAssign?.seatId ? String(prevAssign.seatId) : null;
+
+      // 7) If clear seatId => release previous seat and remove assignment
+      if (!seatId) {
+        if (prevSeatId) {
+          await FlightSeat.updateOne(
+            { _id: prevSeatId, blockedBySessionId: bs._id, status: "held", deleted: false },
+            {
+              $set: { status: "available" },
+              $unset: { blockedBySessionId: 1, blockedAt: 1, blockedUntil: 1 },
+            },
+            { session: mongoSession }
+          );
+        }
+
+        if (prevAssignIdx >= 0) {
+          seg.seatAssignments.splice(prevAssignIdx, 1);
+        }
+
+        // recompute seatTotalSnapshot
+        const total = (seg.seatAssignments || []).reduce(
+          (sum, a) => sum + Number(a.seatPriceSnapshot?.total || 0),
+          0
+        );
+        seg.seatTotalSnapshot = { currency: "VND", total };
+
+        // status
+        bs.status = "ACTIVE";
+
+        await bs.save({ session: mongoSession });
+
+        outSession = bs.toObject();
+        return;
+      }
+
+      const nextSeatId = String(seatId);
+
+      // 8) If changing seat => release old seat first
+      if (prevSeatId && prevSeatId !== nextSeatId) {
+        await FlightSeat.updateOne(
+          { _id: prevSeatId, blockedBySessionId: bs._id, status: "held", deleted: false },
+          {
+            $set: { status: "available" },
+            $unset: { blockedBySessionId: 1, blockedAt: 1, blockedUntil: 1 },
+          },
+          { session: mongoSession }
+        );
+      }
+
+      // 9) Hold new seat (atomic)
+      // only allow:
+      // - available
+      // - or held by this session
+      const holdRes = await FlightSeat.updateOne(
+        {
+          _id: nextSeatId,
+          flightScheduleId: seg.flightScheduleId,
+          deleted: false,
+          $or: [
+            { status: "available" },
+            { status: "held", blockedBySessionId: bs._id },
+          ],
+        },
+        {
+          $set: {
+            status: "held",
+            blockedBySessionId: bs._id,
+            blockedAt: now,
+            blockedUntil: bs.expiresAt,
+          },
+        },
+        { session: mongoSession }
+      );
+
+      if (holdRes.matchedCount === 0) {
+        throw Object.assign(new Error("Seat is not available"), { _http: 409 });
+      }
+
+      // 10) Build seat snapshot: seatNumber + price
+      const fsSeat = await FlightSeat.findById(nextSeatId)
+        .select("seatLayoutId priceAdjustment")
+        .session(mongoSession);
+
+      if (!fsSeat) throw Object.assign(new Error("Seat not found"), { _http: 404 });
+
+      const layout = await SeatLayout.findById(fsSeat.seatLayoutId)
+        .select("seatRow seatColumn seatTypeId seatTypeCode")
+        .session(mongoSession);
+
+      if (!layout) throw Object.assign(new Error("SeatLayout not found"), { _http: 500 });
+
+      const seatNumber = `${layout.seatRow}${layout.seatColumn}`;
+
+      let seatTypeBasePrice = 0;
+      if (layout.seatTypeId) {
+        const st = await SeatType.findById(layout.seatTypeId).select("basePrice").session(mongoSession);
+        seatTypeBasePrice = Number(st?.basePrice || 0);
+      }
+
+      const price = calcSeatPriceVND({
+        seatTypeBasePrice,
+        priceAdjustment: fsSeat.priceAdjustment,
+      });
+
+      // 11) Upsert assignment
+      const nextAssign = {
+        paxIndex: paxIdx,
+        seatId: nextSeatId,
+        seatNumber,
+        seatPriceSnapshot: { currency: "VND", total: price },
+      };
+
+      // enforce unique seatId inside this segment
+      const seatTakenByOther = (seg.seatAssignments || []).find(
+        (a) => String(a.seatId) === nextSeatId && Number(a.paxIndex) !== paxIdx
+      );
+      if (seatTakenByOther) {
+        // rollback seat hold we just made (best effort)
+        await FlightSeat.updateOne(
+          { _id: nextSeatId, blockedBySessionId: bs._id, status: "held", deleted: false },
+          {
+            $set: { status: "available" },
+            $unset: { blockedBySessionId: 1, blockedAt: 1, blockedUntil: 1 },
+          },
+          { session: mongoSession }
+        );
+        throw Object.assign(new Error("Seat already assigned to another passenger in this session"), { _http: 409 });
+      }
+
+      if (prevAssignIdx >= 0) {
+        seg.seatAssignments[prevAssignIdx] = nextAssign;
+      } else {
+        seg.seatAssignments.push(nextAssign);
+      }
+
+      // 12) recompute seatTotalSnapshot
+      const total = (seg.seatAssignments || []).reduce(
+        (sum, a) => sum + Number(a.seatPriceSnapshot?.total || 0),
+        0
+      );
+      seg.seatTotalSnapshot = { currency: "VND", total };
+
+      bs.status = "HOLDING";
+
+      await bs.save({ session: mongoSession });
+
+      outSession = bs.toObject();
+    });
+
+    const remainingMs = outSession?.expiresAt
+      ? new Date(outSession.expiresAt).getTime() - Date.now()
+      : 0;
+
+    // Gia hạn cookie bs_token để khớp TTL bookingSession (chỉ cho GUEST)
+    if (outSession?.ownerType === "GUEST") {
+      const bsToken = req.cookies?.bs_token;
+      if (bsToken && outSession?.expiresAt) {
+        res.cookie("bs_token", bsToken, {
+          httpOnly: true,
+          sameSite: "none",
+          secure: true,
+          maxAge: Math.max(0, remainingMs), // kéo dài đúng theo expiresAt mới
+        });
+      }
+    }
+
+    // trả tối thiểu những thứ FE cần để hydrate
+    return sendResponseHelper.successResponse(res, {
+      data: {
+        publicId: outSession.publicId,
+        status: outSession.status,
+        expiresAt: outSession.expiresAt,
+        segments: (outSession.segments || []).map((s) => ({
+          direction: s.direction,
+          flightScheduleId: s.flightScheduleId,
+          seatAssignments: s.seatAssignments || [],
+          seatTotalSnapshot: s.seatTotalSnapshot || { currency: "VND", total: 0 },
+        })),
+        meta: {
+          serverTime: new Date().toISOString(),
+          remainingSeconds: Math.max(0, Math.floor(remainingMs / 1000)),
+        },
+      },
+    });
+  } catch (err) {
+    const statusCode = err?._http || 500;
+    return sendResponseHelper.errorResponse(res, {
+      statusCode,
+      errorCode: err?.message || "Internal error",
+    });
+  } finally {
+    mongoSession.endSession();
+  }
+}
