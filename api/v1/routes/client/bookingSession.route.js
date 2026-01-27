@@ -10,4 +10,6 @@ router.post('/create', controller.create);
 
 router.patch('/:publicId/seat-assignments', controller.patchSeatAssignments);
 
+router.patch('/:publicId', controller.updateBookingSession);
+
 module.exports = router;

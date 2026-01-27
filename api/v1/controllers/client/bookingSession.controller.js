@@ -812,3 +812,341 @@ module.exports.patchSeatAssignments = async (req, res) => {
     mongoSession.endSession();
   }
 }
+// [PATCH] /api/v1/booking-sessions/:publicId
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function normalizeDigits(s) {
+  return String(s || "").replace(/\D/g, "");
+}
+
+function getDirsToCheck(tripType) {
+  return tripType === "ROUND_TRIP" ? ["OUTBOUND", "INBOUND"] : ["OUTBOUND"];
+}
+
+function validateAndNormalizeContactInfo(contactInfo) {
+  if (!contactInfo) {
+    throw Object.assign(new Error("contactInfo is required"), { _http: 422 });
+  }
+
+  const firstName = String(contactInfo.firstName || "").trim();
+  const lastName = String(contactInfo.lastName || "").trim();
+  const email = normalizeEmail(contactInfo.email);
+  const countryCodeRaw = String(contactInfo.countryCode || "+84").trim();
+
+  // FE đang gửi phone đã nối countryCode + phone
+  // => normalize digits để DB nhất quán
+  const phoneDigits = normalizeDigits(contactInfo.phone);
+
+  if (!firstName || !lastName) {
+    throw Object.assign(new Error("Invalid contact name"), { _http: 422 });
+  }
+  if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
+    throw Object.assign(new Error("Invalid contact email"), { _http: 422 });
+  }
+  if (!phoneDigits) {
+    throw Object.assign(new Error("Invalid contact phone"), { _http: 422 });
+  }
+
+  // có thể normalize countryCode về dạng +84
+  const ccDigits = normalizeDigits(countryCodeRaw);
+  const countryCode = ccDigits ? `+${ccDigits}` : "+84";
+
+  return {
+    firstName,
+    lastName,
+    email,
+    countryCode,
+    phone: phoneDigits, // lưu digits
+  };
+}
+
+/**
+ * passengers rules:
+ * - passengers must be array length == adults+children+infants
+ * - paxIndex must cover 0..total-1 unique
+ * - passengerType must match index mapping:
+ *   0..adults-1 => ADULT
+ *   adults..adults+children-1 => CHILD
+ *   rest => INFANT
+ * - dateOfBirth must exist, valid, not in future
+ */
+function validateAndNormalizePassengers(passengers, passengersCount, now = new Date()) {
+  const adults = Number(passengersCount?.adults || 0);
+  const children = Number(passengersCount?.children || 0);
+  const infants = Number(passengersCount?.infants || 0);
+
+  const total = adults + children + infants;
+  if (!Array.isArray(passengers) || passengers.length !== total) {
+    throw Object.assign(new Error("Passengers count mismatch"), { _http: 422 });
+  }
+
+  const seen = new Set();
+  const normalized = new Array(total);
+
+  for (const p of passengers) {
+    const paxIndex = Number(p.paxIndex);
+    if (!Number.isInteger(paxIndex) || paxIndex < 0 || paxIndex >= total) {
+      throw Object.assign(new Error("Invalid paxIndex"), { _http: 422 });
+    }
+    if (seen.has(paxIndex)) {
+      throw Object.assign(new Error("Duplicate paxIndex"), { _http: 422 });
+    }
+    seen.add(paxIndex);
+
+    const firstName = String(p.firstName || "").trim();
+    const lastName = String(p.lastName || "").trim();
+    if (!firstName || !lastName) {
+      throw Object.assign(new Error("Invalid passenger name"), { _http: 422 });
+    }
+
+    const dobStr = p.date_of_birth || p.dateOfBirth || null; // FE đang gửi date_of_birth
+    const dob = dobStr ? new Date(dobStr) : null;
+    if (!dob || Number.isNaN(dob.getTime())) {
+      throw Object.assign(new Error("Invalid dateOfBirth"), { _http: 422 });
+    }
+    if (dob > now) {
+      throw Object.assign(new Error("dateOfBirth cannot be in the future"), { _http: 422 });
+    }
+
+    const title = String(p.title || "").toUpperCase();
+    const gender = String(p.gender || "").toUpperCase();
+
+    // expected passengerType by index
+    const expectedType =
+      paxIndex < adults ? "ADULT" : paxIndex < adults + children ? "CHILD" : "INFANT";
+
+    const passengerType = String(p.passengerType || expectedType).toUpperCase();
+    if (passengerType !== expectedType) {
+      throw Object.assign(
+        new Error(`passengerType mismatch at paxIndex ${paxIndex} (expected ${expectedType})`),
+        { _http: 422 }
+      );
+    }
+
+    normalized[paxIndex] = {
+      paxIndex,
+      passengerType,
+      title,
+      firstName,
+      lastName,
+      dateOfBirth: dobStr, // lưu string yyyy-mm-dd cho consistent
+      fullName: String(p.fullName || `${lastName} ${firstName}`).trim(),
+      gender,
+    };
+  }
+
+  // ensure full coverage
+  for (let i = 0; i < total; i++) {
+    if (!normalized[i]) {
+      throw Object.assign(new Error("Passengers missing paxIndex coverage"), { _http: 422 });
+    }
+  }
+
+  return normalized;
+}
+
+/**
+ * seat coverage:
+ * - only adult+child need seat
+ * - check only dirs per tripType
+ * - ensure each paxIndex 0..maxSeatPax-1 has assignment
+ * - (strong) verify FlightSeat is held by this session
+ */
+async function assertSeatCoverageAndHeld(bs, mongoSession) {
+  const pc = bs.passengersCount || {};
+  const maxSeatPax = Number(pc.adults || 0) + Number(pc.children || 0);
+  const dirs = getDirsToCheck(bs.tripType);
+
+  // gather seatIds to verify held
+  const seatIdsToVerify = [];
+
+  for (const dir of dirs) {
+    const seg = (bs.segments || []).find((s) => s.direction === dir);
+    if (!seg) throw Object.assign(new Error(`Segment missing for ${dir}`), { _http: 500 });
+
+    const assigned = new Map(); // paxIndex -> seatId
+    for (const a of seg.seatAssignments || []) {
+      assigned.set(Number(a.paxIndex), String(a.seatId || ""));
+    }
+
+    for (let i = 0; i < maxSeatPax; i++) {
+      const sid = assigned.get(i);
+      if (!sid) {
+        throw Object.assign(new Error(`Missing seat for paxIndex ${i} (${dir})`), { _http: 422 });
+      }
+      seatIdsToVerify.push(sid);
+    }
+  }
+
+  // verify all these seats are HELD by this session (atomic safety)
+  // (nếu muốn nhẹ hơn có thể bỏ đoạn này)
+  const uniqueSeatIds = Array.from(new Set(seatIdsToVerify));
+
+  const seats = await FlightSeat.find({
+    _id: { $in: uniqueSeatIds },
+    deleted: false,
+  })
+    .select("_id status blockedBySessionId blockedUntil")
+    .session(mongoSession)
+    .lean();
+
+  const byId = new Map(seats.map((s) => [String(s._id), s]));
+  for (const sid of uniqueSeatIds) {
+    const seat = byId.get(String(sid));
+    if (!seat) {
+      throw Object.assign(new Error("Seat not found while confirming"), { _http: 409 });
+    }
+    if (String(seat.blockedBySessionId || "") !== String(bs._id)) {
+      throw Object.assign(new Error("Seat is not held by this session"), { _http: 409 });
+    }
+    if (String(seat.status || "").toLowerCase() !== "held") {
+      throw Object.assign(new Error("Seat is not in HELD status"), { _http: 409 });
+    }
+  }
+}
+
+// [PATCH] /api/v1/booking-sessions/:publicId
+module.exports.updateBookingSession = async (req, res) => {
+  const mongoSession = await mongoose.startSession();
+
+  try {
+    const { publicId } = req.params;
+    const { contactInfo, passengers, client } = req.body || {};
+
+    if (!publicId) {
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "publicId is required" });
+    }
+
+    const now = new Date();
+    const ttlMin = Number(process.env.BOOKING_SESSION_TTL_MINUTES || 15);
+
+    let outSession = null;
+
+    await mongoSession.withTransaction(async () => {
+      // 1) load session (+secret hash)
+      const bs = await BookingSession.findOne({ publicId })
+        .select("+sessionSecretHash")
+        .session(mongoSession);
+
+      if (!bs) throw Object.assign(new Error("BookingSession not found"), { _http: 404 });
+      if (bs.expiresAt && new Date(bs.expiresAt) <= now) throw Object.assign(new Error("BookingSession expired"), { _http: 410 });
+      if (["EXPIRED", "CANCELLED"].includes(bs.status)) throw Object.assign(new Error(`BookingSession ${String(bs.status).toLowerCase()}`), { _http: 410 });
+
+      // 2) verify owner (ACCOUNT / GUEST)
+      if (bs.ownerType === "ACCOUNT") {
+        const userId = req.user?._id;
+        if (!userId) throw Object.assign(new Error("Unauthorized"), { _http: 401 });
+        if (String(userId) !== String(bs.accountId)) throw Object.assign(new Error("Forbidden"), { _http: 403 });
+      } else {
+        const guestId = req.cookies?.guest_id;
+        const bsToken = req.cookies?.bs_token;
+
+        if (!guestId || !bsToken) throw Object.assign(new Error("Unauthorized (missing guest cookies)"), { _http: 401 });
+        if (String(bs.guestId || "") !== String(guestId)) throw Object.assign(new Error("Forbidden (guestId mismatch)"), { _http: 403 });
+
+        const tokenHash = sha256(bsToken);
+        if (tokenHash !== bs.sessionSecretHash) throw Object.assign(new Error("Forbidden (invalid session secret)"), { _http: 403 });
+      }
+
+      // 3) Confirm idempotency (KHÔNG dùng idempotencyKey của create)
+      const idemKey = client?.idempotencyKey ? String(client.idempotencyKey) : null;
+      if (!idemKey) {
+        throw Object.assign(new Error("client.idempotencyKey is required"), { _http: 422 });
+      }
+
+      // nếu đã confirm trước đó với cùng key => trả lại luôn (safe retry)
+      if (bs.confirmIdempotencyKey && bs.confirmIdempotencyKey === idemKey) {
+        outSession = bs.toObject();
+        return;
+      }
+
+      // nếu đã set confirm key mà khác => chặn replay “khác key”
+      if (bs.confirmIdempotencyKey && bs.confirmIdempotencyKey !== idemKey) {
+        throw Object.assign(new Error("Confirm idempotencyKey mismatch"), { _http: 409 });
+      }
+
+      // set lần đầu
+      bs.confirmIdempotencyKey = idemKey;
+
+      // 4) Validate + normalize contactInfo (required)
+      const normalizedContact = validateAndNormalizeContactInfo(contactInfo);
+
+      // 5) Validate + normalize passengers (required)
+      const normalizedPassengers = validateAndNormalizePassengers(passengers, bs.passengersCount, now);
+
+      // 6) Validate seat coverage (server truth) + verify held seats belong to this session
+      await assertSeatCoverageAndHeld(bs, mongoSession);
+
+      // 7) extend TTL + extend blocked seats blockedUntil
+      const newExpiresAt = addMinutes(now, ttlMin);
+      bs.expiresAt = newExpiresAt;
+      bs.lastActivityAt = now;
+
+      await FlightSeat.updateMany(
+        { blockedBySessionId: bs._id, status: "held", deleted: false },
+        { $set: { blockedUntil: newExpiresAt } },
+        { session: mongoSession }
+      );
+
+      // 8) save confirm data
+      bs.contactInfo = normalizedContact;
+      bs.passengers = normalizedPassengers;
+
+      // status:
+      // - đang dùng HOLDING cho “đã hold ghế”
+      // - confirm xong vẫn HOLDING, tới khi start payment mới PAYMENT_PENDING
+      bs.status = "READY_FOR_PAYMENT";
+      bs.confirmedAt = now;
+
+      await bs.save({ session: mongoSession });
+      outSession = bs.toObject();
+    });
+
+    const remainingMs = outSession?.expiresAt
+      ? new Date(outSession.expiresAt).getTime() - Date.now()
+      : 0;
+
+    // extend cookie for guest
+    if (outSession?.ownerType === "GUEST") {
+      const bsToken = req.cookies?.bs_token;
+      if (bsToken && outSession?.expiresAt) {
+        res.cookie("bs_token", bsToken, {
+          httpOnly: true,
+          sameSite: "none",
+          secure: true,
+          maxAge: Math.max(0, remainingMs),
+        });
+      }
+    }
+
+    return sendResponseHelper.successResponse(res, {
+      data: {
+        publicId: outSession.publicId,
+        status: outSession.status,
+        expiresAt: outSession.expiresAt,
+        contactInfo: outSession.contactInfo,
+        passengers: outSession.passengers,
+        segments: (outSession.segments || []).map((s) => ({
+          direction: s.direction,
+          flightScheduleId: s.flightScheduleId,
+          seatAssignments: s.seatAssignments || [],
+          seatTotalSnapshot: s.seatTotalSnapshot || { currency: "VND", total: 0 },
+        })),
+        meta: {
+          serverTime: new Date().toISOString(),
+          remainingSeconds: Math.max(0, Math.floor(remainingMs / 1000)),
+        },
+      },
+    });
+  } catch (err) {
+    const statusCode = err?._http || 500;
+    return sendResponseHelper.errorResponse(res, {
+      statusCode,
+      errorCode: err?.message || "Internal error",
+    });
+  } finally {
+    mongoSession.endSession();
+  }
+};
