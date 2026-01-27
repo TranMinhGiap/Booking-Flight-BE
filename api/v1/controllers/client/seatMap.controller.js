@@ -1,6 +1,6 @@
 const mongoose = require("mongoose");
 const sendResponseHelper = require("../../../../helpers/sendResponse.helper");
-
+const { computeAisles, mapSeatStatus } = require("../../../../helpers/seatMap.helper");
 const FlightSchedule = require("../../models/flightSchedule.model");
 const SeatClass = require("../../models/seatClass.model");
 const SeatLayout = require("../../models/seatLayout.model");
@@ -14,7 +14,7 @@ const FlightSeat = require("../../models/flightSeat.model");
  * - seat_class = "ECONOMY" | "BUSINESS_CLASS" ... (map to className)
  * - seat_class = "Y" | "C" ... (map to classCode)
  */
-async function resolveSeatClass({ seatClassId, seatClassCode, seat_class }) {
+const resolveSeatClass = async ({ seatClassId, seatClassCode, seat_class }) => {
   // 1) direct seatClassId
   if (seatClassId && mongoose.Types.ObjectId.isValid(seatClassId)) {
     return SeatClass.findOne({ _id: seatClassId, deleted: false, status: "active" }).lean();
@@ -48,45 +48,6 @@ async function resolveSeatClass({ seatClassId, seatClassCode, seat_class }) {
 
   return SeatClass.findOne({ className, deleted: false, status: "active" }).lean();
 }
-
-/**
- * Heuristic aisles: if 6 columns -> aisle after 3, if 4 -> after 2
- * FE vẫn chạy tốt nếu aisles=[]
- */
-function computeAisles(columns) {
-  const n = columns.length;
-  if (n === 4) return [2]; // A B | C D
-  if (n === 5) return [1,4]; 
-  if (n === 6) return [3]; // A B C | D E F
-  if (n === 7) return [3, 5];
-  if (n === 8) return [2, 6];
-  if (n === 9) return [3, 6];
-  if (n === 10) return [3, 7];
-  // Tốt nhất sau này thêm Aisles vào đâu đó (Layout chẳng hạn)
-  return [];
-}
-
-/**
- * Map FlightSeat.status -> FE status
- */
-function mapSeatStatus(flightSeat, now) {
-  // if no FlightSeat doc (shouldn't happen if seeded), treat as unavailable
-  if (!flightSeat) return "BOOKED";
-
-  const st = String(flightSeat.status || "").toLowerCase();
-
-  if (st === "available") return "AVAILABLE";
-  if (st === "booked") return "BOOKED";
-
-  // HELD: if expired, treat as AVAILABLE (cleanup may run later)
-  if (st === "held") {
-    if (flightSeat.blockedUntil && new Date(flightSeat.blockedUntil) <= now) return "AVAILABLE";
-    return "HELD";
-  }
-
-  return "BOOKED";
-}
-
 /**
  * [GET] /api/v1/seats/frontend?flightScheduleId=...&seat_class=ECONOMY
  * Optional:
