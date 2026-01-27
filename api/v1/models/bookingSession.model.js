@@ -194,6 +194,7 @@ const BookingSessionSchema = new Schema(
       enum: [
         "ACTIVE",          // session sống, user đang thao tác
         "HOLDING",         // đã hold 1 phần/đủ ghế (tuỳ bạn set khi chọn ghế)
+        "READY_FOR_PAYMENT", // bắt đầu thanh toán
         "PAYMENT_PENDING", // redirect/đang chờ payment gateway
         "CONFIRMED",       // đã convert thành booking thật
         "CANCELLED",       // user huỷ
@@ -215,6 +216,11 @@ const BookingSessionSchema = new Schema(
     // optional: idempotency (ngăn double-click create session)
     idempotencyKey: { type: String, index: true },
 
+    confirmIdempotencyKey: { type: String, index: true },
+
+    paymentIdempotencyKey: { type: String, index: true },
+    activePaymentId,
+
     // optional: telemetry/debug/anti-abuse
     createdIp: { type: String },
     userAgent: { type: String },
@@ -234,6 +240,8 @@ BookingSessionSchema.index({ ownerType: 1, status: 1, expiresAt: 1 });
 BookingSessionSchema.index({ accountId: 1, status: 1, expiresAt: 1 });
 BookingSessionSchema.index({ guestId: 1, status: 1, expiresAt: 1 });
 BookingSessionSchema.index({ "segments.flightScheduleId": 1, status: 1, expiresAt: 1 });
+BookingSessionSchema.index({ confirmIdempotencyKey: 1, ownerType: 1, expiresAt: 1 });
+BookingSessionSchema.index({ paymentIdempotencyKey: 1, ownerType: 1, expiresAt: 1 });
 
 /**
  * Validate: nếu ownerType=ACCOUNT thì accountId phải có.
