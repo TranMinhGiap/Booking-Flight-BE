@@ -160,6 +160,22 @@ module.exports.getSeatMap = async (req, res) => {
 
     const seatLayoutIds = layouts.map((x) => x._id);
 
+    // * Giải phóng ghế trước khi load SeatMap. 
+    // Sau này kêt hợp với cron job định kỳ: Viết một cron job (ví dụ Node.js cron hoặc MongoDB TTL index) chạy mỗi 1-5 phút để cleanup toàn hệ thống
+    // => Trong logic build SeatMap (backend hoặc frontend), coi ghế "held" nhưng blockedUntil <= now là "available". (cron chưa kịp chạy)
+    await FlightSeat.updateMany(
+      {
+        flightScheduleId: fs._id,
+        status: "held",
+        blockedUntil: { $lte: new Date() },
+        deleted: false,
+      },
+      {
+        $set: { status: "available" },
+        $unset: { blockedBySessionId: 1, blockedAt: 1, blockedUntil: 1 },
+      }
+    );
+
     // 5) flight seats for schedule + layouts
     const flightSeats = await FlightSeat.find({
       flightScheduleId: fs._id,
