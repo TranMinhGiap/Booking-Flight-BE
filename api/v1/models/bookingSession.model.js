@@ -219,7 +219,12 @@ const BookingSessionSchema = new Schema(
     confirmIdempotencyKey: { type: String, index: true },
 
     paymentIdempotencyKey: { type: String, index: true },
-    activePaymentId,
+
+    // active payment attempt đang dùng (để resume / tránh tạo tràn attempts)
+    activePaymentId: { type: Schema.Types.ObjectId, ref: "Payment", index: true, default: null },
+
+    // tăng dần để tạo attemptNo, atomic trong transaction
+    paymentAttemptSeq: { type: Number, default: 0, min: 0 },
 
     // optional: telemetry/debug/anti-abuse
     createdIp: { type: String },
