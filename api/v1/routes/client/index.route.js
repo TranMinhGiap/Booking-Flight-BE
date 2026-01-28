@@ -4,6 +4,7 @@ const seatClassRoutes = require('./seatClass.route');
 const flightScheduleRoutes = require('./flightSchedule.route');
 const bookingSessionRoutes = require('./bookingSession.route');
 const seatMapRoutes = require('./seatMap.route');
+const paymentMethodRoutes = require('./paymentMethod.route');
 
 module.exports = (app) => {
   // Version api
@@ -20,4 +21,6 @@ module.exports = (app) => {
   app.use(version + '/booking-sessions', bookingSessionRoutes);
 
   app.use(version + '/seat-maps', seatMapRoutes);
+
+  app.use(version + '/payment-methods', paymentMethodRoutes);
 }
