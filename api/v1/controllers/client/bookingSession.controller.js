@@ -125,6 +125,22 @@ module.exports.index = async (req, res) => {
       },
       { $unwind: "$flight" },
       { $match: { "flight.deleted": false, "flight.status": "active" } },
+      {
+        $addFields: {
+          _durationMs: { $subtract: ["$fs.arrivalTime", "$fs.departureTime"] },
+        },
+      },
+      {
+        $addFields: {
+          _durationMinutesSafe: {
+            $cond: {
+              if: { $gte: ["$_durationMs", 0] },
+              then: { $round: [{ $divide: ["$_durationMs", 60000] }] },
+              else: "$flight.durationMinutes",
+            },
+          },
+        },
+      },
 
       // join Airline
       {
@@ -197,6 +213,7 @@ module.exports.index = async (req, res) => {
               id: "$fs._id",
               departureAt: "$fs.departureTime",
               arrivalAt: "$fs.arrivalTime",
+              durationMinutes: "$_durationMinutesSafe",
               status: "$fs.status",
               airplaneId: "$fs.airplaneId",
             },
