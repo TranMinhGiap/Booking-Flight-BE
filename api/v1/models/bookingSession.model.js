@@ -1,16 +1,9 @@
 // models/bookingSession.model.js
 const mongoose = require("mongoose");
-const crypto = require("crypto");
 const { v4: uuidv4 } = require("uuid");
+const { sha256 } = require("../../../helpers/sha256.helper");
 
 const { Schema } = mongoose;
-
-/**
- * Helpers: hash secret (KHÔNG lưu raw secret trong DB)
- */
-function sha256(input) {
-  return crypto.createHash("sha256").update(String(input)).digest("hex");
-}
 
 /**
  * ContactInfo snapshot schema
@@ -323,36 +316,6 @@ BookingSessionSchema.methods.generateAndSetSecret = function () {
   const rawSecret = crypto.randomBytes(32).toString("hex"); // 64 chars
   this.sessionSecretHash = sha256(rawSecret);
   return rawSecret;
-};
-
-BookingSessionSchema.methods.verifySecret = function (rawSecret) {
-  if (!rawSecret) return false;
-  return this.sessionSecretHash === sha256(rawSecret);
-};
-
-/**
- * Utility: recompute grandTotalSnapshot từ segments + pax count (tuỳ rule của bạn)
- * Gợi ý: gọi ở service mỗi lần update giá/segment.
- */
-BookingSessionSchema.methods.recomputeGrandTotal = function () {
-  const segs = this.segments || [];
-  const sum = { currency: "VND", adult: 0, child: 0, infant: 0, total: 0 };
-
-  for (const s of segs) {
-    const p = s.priceSnapshot || {};
-    sum.currency = p.currency || sum.currency;
-    sum.adult += Number(p.adult || 0);
-    sum.child += Number(p.child || 0);
-    sum.infant += Number(p.infant || 0);
-    sum.total += Number(p.total || 0);
-
-    const seat = s.seatTotalSnapshot || {};
-    // seat fee thường chỉ có "total"
-    if (seat.currency) sum.currency = seat.currency;
-    sum.total += Number(seat.total || 0);
-  }
-
-  this.grandTotalSnapshot = sum;
 };
 
 module.exports = mongoose.model("BookingSession", BookingSessionSchema, "booking_sessions");
