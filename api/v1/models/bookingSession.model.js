@@ -2,7 +2,7 @@
 const mongoose = require("mongoose");
 const { v4: uuidv4 } = require("uuid");
 const { sha256 } = require("../../../helpers/sha256.helper");
-
+const crypto = require("crypto");
 const { Schema } = mongoose;
 
 /**
