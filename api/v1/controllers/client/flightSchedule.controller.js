@@ -216,17 +216,17 @@ module.exports.index = async (req, res) => {
                     { $eq: ["$deleted", false] },
                     INCLUDE_EXPIRED_HELD_AS_AVAILABLE
                       ? {
-                          $or: [
-                            { $eq: ["$status", "available"] },
-                            {
-                              $and: [
-                                { $eq: ["$status", "held"] },
-                                { $ne: ["$blockedUntil", null] },
-                                { $lt: ["$blockedUntil", now] },
-                              ],
-                            },
-                          ],
-                        }
+                        $or: [
+                          { $eq: ["$status", "available"] },
+                          {
+                            $and: [
+                              { $eq: ["$status", "held"] },
+                              { $ne: ["$blockedUntil", null] },
+                              { $lt: ["$blockedUntil", now] },
+                            ],
+                          },
+                        ],
+                      }
                       : { $eq: ["$status", "available"] },
                   ],
                 },
@@ -259,7 +259,7 @@ module.exports.index = async (req, res) => {
         },
       },
 
-      // tính availableCount + totalAdult + duration + airlineId + flightNumber
+      // tính availableCount + totalAdult + airlineId + flightNumber
       {
         $addFields: {
           availableCount: {
@@ -281,7 +281,6 @@ module.exports.index = async (req, res) => {
               "$priceBreakdown.serviceFee",
             ],
           },
-          durationMinutes: "$flight.durationMinutes",
           airlineId: "$flight.airlineId",
           flightNumber: "$flight.flightNumber",
         },
@@ -309,6 +308,27 @@ module.exports.index = async (req, res) => {
           },
           arrMinuteOfDay: {
             $add: [{ $multiply: ["$_arrParts.hour", 60] }, "$_arrParts.minute"],
+          },
+        },
+      },
+
+      // ───────────────────────────────────────────────────────────────
+      // TÍNH DURATION ĐỘNG TỪ departureTime và arrivalTime
+      {
+        $addFields: {
+          durationMs: {
+            $subtract: ["$arrivalTime", "$departureTime"],
+          },
+        },
+      },
+      {
+        $addFields: {
+          durationMinutes: {
+            $cond: {
+              if: { $gte: ["$durationMs", 0] },
+              then: { $round: [{ $divide: ["$durationMs", 60000] }] },
+              else: "$flight.durationMinutes", // fallback nếu dữ liệu lỗi
+            },
           },
         },
       },
@@ -487,9 +507,9 @@ module.exports.index = async (req, res) => {
     const safeFacets = out.facets?.priceRange
       ? out.facets
       : {
-          priceRange: { min: 0, max: 0, currency: "VND" },
-          durationRange: { min: 0, max: 0 },
-        };
+        priceRange: { min: 0, max: 0, currency: "VND" },
+        durationRange: { min: 0, max: 0 },
+      };
 
     return sendResponseHelper.successResponse(res, {
       data: {
