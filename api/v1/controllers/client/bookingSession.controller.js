@@ -329,101 +329,242 @@ module.exports.index = async (req, res) => {
   }
 };
 // [POST] /api/v1/booking-sessions/create
+const ALLOWED_SCHEDULE_STATUS = new Set(["scheduled", "delayed"]); // tuỳ nghiệp vụ
+const MIN_TURNAROUND_MINUTES = Number(process.env.MIN_TURNAROUND_MINUTES || 0);
+
+function addMinutes(date, minutes) {
+  const d = new Date(date);
+  d.setMinutes(d.getMinutes() + Number(minutes || 0));
+  return d;
+}
+
+function buildGuestId() {
+  // tuỳ : uuid, nanoid...
+  return `guest_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function normalizeTripType(tripType) {
+  return tripType === "ROUND_TRIP" ? "ROUND_TRIP" : "ONE_WAY";
+}
+
+function normalizeSeatClassCode(code) {
+  return String(code || "").trim().toUpperCase();
+}
+
+function isValidObjectId(id) {
+  return mongoose.Types.ObjectId.isValid(String(id));
+}
+
+function toIdStr(x) {
+  return x ? String(x) : "";
+}
+
+function assertPax(pax) {
+  const adults = Number(pax?.adults ?? 1);
+  const children = Number(pax?.children ?? 0);
+  const infants = Number(pax?.infants ?? 0);
+
+  if (!Number.isFinite(adults) || adults < 1) return { ok: false, error: "Invalid adults" };
+  if (!Number.isFinite(children) || children < 0) return { ok: false, error: "Invalid children" };
+  if (!Number.isFinite(infants) || infants < 0) return { ok: false, error: "Invalid infants" };
+
+  // nghiệp vụ thường gặp: infants <= adults
+  if (infants > adults) return { ok: false, error: "Infants cannot exceed adults" };
+
+  return { ok: true, pax: { adults, children, infants } };
+}
+
+function normalizeSegments(segments, tripType) {
+  if (!Array.isArray(segments) || segments.length < 1 || segments.length > 2) {
+    return { ok: false, error: "segments must be 1 or 2 items" };
+  }
+
+  const t = normalizeTripType(tripType);
+
+  if (t === "ONE_WAY" && segments.length !== 1) {
+    return { ok: false, error: "ONE_WAY must have 1 segment" };
+  }
+  if (t === "ROUND_TRIP" && segments.length !== 2) {
+    return { ok: false, error: "ROUND_TRIP must have 2 segments" };
+  }
+
+  // map theo direction để không phụ thuộc order FE gửi lên
+  const map = new Map();
+  for (const seg of segments) {
+    const dir = seg?.direction;
+    if (dir !== "OUTBOUND" && dir !== "INBOUND") {
+      return { ok: false, error: "direction must be OUTBOUND or INBOUND" };
+    }
+    if (map.has(dir)) {
+      return { ok: false, error: `Duplicate direction: ${dir}` };
+    }
+    map.set(dir, seg);
+  }
+
+  if (t === "ONE_WAY") {
+    if (!map.has("OUTBOUND")) return { ok: false, error: "ONE_WAY direction must be OUTBOUND" };
+  } else {
+    if (!map.has("OUTBOUND") || !map.has("INBOUND")) {
+      return { ok: false, error: "ROUND_TRIP must include OUTBOUND & INBOUND" };
+    }
+  }
+
+  const out = map.get("OUTBOUND") || null;
+  const inn = map.get("INBOUND") || null;
+
+  // kiểm tra field bắt buộc
+  const reqFields = (seg) => seg?.flightScheduleId && seg?.seatClassCode;
+  if (out && !reqFields(out)) return { ok: false, error: "OUTBOUND requires flightScheduleId & seatClassCode" };
+  if (inn && !reqFields(inn)) return { ok: false, error: "INBOUND requires flightScheduleId & seatClassCode" };
+
+  // tránh user gửi cùng 1 schedule cho cả 2 chặng
+  if (out && inn && toIdStr(out.flightScheduleId) === toIdStr(inn.flightScheduleId)) {
+    return { ok: false, error: "OUTBOUND and INBOUND cannot be the same flightScheduleId" };
+  }
+
+  return { ok: true, tripType: t, out, inn };
+}
+
+async function loadSeatClass(seatClassCode) {
+  const code = normalizeSeatClassCode(seatClassCode);
+  if (!code) return null;
+
+  const seatClassDoc = await SeatClass.findOne({
+    classCode: code,
+    deleted: false,
+    status: "active",
+  }).lean();
+
+  if (!seatClassDoc) return null;
+  return seatClassDoc;
+}
+
+/**
+ * Load flightSchedule + populate flightId để có departureAirportId/arrivalAirportId
+ */
+async function loadScheduleWithFlight(flightScheduleId) {
+  if (!isValidObjectId(flightScheduleId)) return null;
+
+  const fs = await FlightSchedule.findOne({
+    _id: flightScheduleId,
+    deleted: false,
+  })
+    .populate({
+      path: "flightId",
+      select: "departureAirportId arrivalAirportId airlineId flightNumber status deleted durationMinutes",
+    })
+    .lean();
+
+  if (!fs) return null;
+  return fs;
+}
+
+async function loadFareSnapshot(flightScheduleId, seatClassId) {
+  const fare = await FlightFare.findOne({
+    flightScheduleId,
+    seatClassId,
+    deleted: false,
+  })
+    .select("basePrice tax serviceFee currency")
+    .lean();
+
+  if (!fare) return null;
+  return fare;
+}
+
+function ensureScheduleBookable(fs) {
+  if (!fs) return { ok: false, error: "Invalid flightScheduleId" };
+
+  if (fs.deleted) return { ok: false, error: "FlightSchedule deleted" };
+
+  if (!ALLOWED_SCHEDULE_STATUS.has(fs.status)) {
+    return { ok: false, error: `FlightSchedule status not bookable: ${fs.status}` };
+  }
+
+  // nghiệp vụ: không cho đặt nếu đã bay
+  const now = Date.now();
+  const dep = fs.departureTime ? new Date(fs.departureTime).getTime() : null;
+  if (!dep || !Number.isFinite(dep)) return { ok: false, error: "Invalid departureTime" };
+  if (dep <= now) return { ok: false, error: "FlightSchedule already departed" };
+
+  // flight must exist & active
+  const fl = fs.flightId;
+  if (!fl) return { ok: false, error: "Flight not found for schedule" };
+  if (fl.deleted) return { ok: false, error: "Flight deleted" };
+  if (fl.status && fl.status !== "active") return { ok: false, error: "Flight inactive" };
+
+  return { ok: true };
+}
+
+function validateRoundTripBusiness(outFs, inFs) {
+  // bắt buộc inbound đảo chiều outbound
+  const outFlight = outFs?.flightId;
+  const inFlight = inFs?.flightId;
+
+  const outDep = toIdStr(outFlight?.departureAirportId);
+  const outArr = toIdStr(outFlight?.arrivalAirportId);
+
+  const inDep = toIdStr(inFlight?.departureAirportId);
+  const inArr = toIdStr(inFlight?.arrivalAirportId);
+
+  if (!outDep || !outArr || !inDep || !inArr) {
+    return { ok: false, error: "Missing flight route info" };
+  }
+
+  // inbound phải là reverse route của outbound
+  if (!(inDep === outArr && inArr === outDep)) {
+    return {
+      ok: false,
+      error: "INBOUND route must be reverse of OUTBOUND",
+      detail: {
+        outbound: { from: outDep, to: outArr },
+        inbound: { from: inDep, to: inArr },
+      },
+    };
+  }
+
+  // inbound phải bay sau outbound đến + turnaround
+  const outArrTime = new Date(outFs.arrivalTime).getTime();
+  const inDepTime = new Date(inFs.departureTime).getTime();
+
+  const minInDep = outArrTime + MIN_TURNAROUND_MINUTES * 60 * 1000;
+  if (inDepTime < minInDep) {
+    return {
+      ok: false,
+      error: `INBOUND departure must be after OUTBOUND arrival (+${MIN_TURNAROUND_MINUTES}m)`,
+    };
+  }
+
+  return { ok: true };
+}
+
+// [POST] /api/v1/booking-sessions/create
 module.exports.create = async (req, res) => {
   try {
-    const {
-      tripType = "ONE_WAY",
-      segments = [],
-      passengersCount,
-      idempotencyKey,
-    } = req.body || {};
+    const { tripType = "ONE_WAY", segments = [], passengersCount, idempotencyKey } = req.body || {};
 
-    // ========== 1) validate pax ==========
-    const pax = {
-      adults: Number(passengersCount?.adults ?? 1),
-      children: Number(passengersCount?.children ?? 0),
-      infants: Number(passengersCount?.infants ?? 0),
-    };
+    // 1) pax
+    const paxResult = assertPax(passengersCount);
+    if (!paxResult.ok) {
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: paxResult.error });
+    }
+    const pax = paxResult.pax;
 
-    if (!Number.isFinite(pax.adults) || pax.adults < 1) {
-      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Invalid adults" });
+    // 2) segments normalize (không phụ thuộc order FE)
+    const segResult = normalizeSegments(segments, tripType);
+    if (!segResult.ok) {
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: segResult.error });
     }
-    if (!Number.isFinite(pax.children) || pax.children < 0) {
-      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Invalid children" });
-    }
-    if (!Number.isFinite(pax.infants) || pax.infants < 0) {
-      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Invalid infants" });
-    }
-    // NEW: infant <= adult
-    if (pax.infants > pax.adults) {
-      return sendResponseHelper.errorResponse(res, {
-        statusCode: 400,
-        errorCode: "Invalid infants: infants must be <= adults",
-      });
-    }
+    const normalizedTripType = segResult.tripType;
+    const outSeg = segResult.out;
+    const inSeg = segResult.in;
 
-    // ========== 2) validate segments basic ==========
-    if (!Array.isArray(segments) || segments.length < 1 || segments.length > 2) {
-      return sendResponseHelper.errorResponse(res, {
-        statusCode: 400,
-        errorCode: "segments must be 1 or 2 items",
-      });
-    }
-
-    const normalizedTripType = tripType === "ROUND_TRIP" ? "ROUND_TRIP" : "ONE_WAY";
-
-    if (normalizedTripType === "ONE_WAY" && segments.length !== 1) {
-      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "ONE_WAY must have 1 segment" });
-    }
-    if (normalizedTripType === "ROUND_TRIP" && segments.length !== 2) {
-      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "ROUND_TRIP must have 2 segments" });
-    }
-
-    // NEW: normalize directions, allow FE gửi unordered
-    const segByDir = {};
-    for (const s of segments) {
-      const dir = String(s?.direction || "").toUpperCase();
-      if (!dir) {
-        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Missing segment.direction" });
-      }
-      if (dir !== "OUTBOUND" && dir !== "INBOUND") {
-        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: `Invalid direction: ${dir}` });
-      }
-      if (segByDir[dir]) {
-        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: `Duplicate direction: ${dir}` });
-      }
-
-      segByDir[dir] = { ...s, direction: dir };
-    }
-
-    if (normalizedTripType === "ONE_WAY") {
-      if (!segByDir.OUTBOUND) {
-        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "ONE_WAY direction must be OUTBOUND" });
-      }
-    } else {
-      if (!segByDir.OUTBOUND || !segByDir.INBOUND) {
-        return sendResponseHelper.errorResponse(res, {
-          statusCode: 400,
-          errorCode: "ROUND_TRIP must include OUTBOUND & INBOUND",
-        });
-      }
-    }
-
-    // NEW: prevent duplicate flightScheduleId
-    const fsIds = segments.map((s) => String(s?.flightScheduleId || ""));
-    if (fsIds.some((x) => !x) || new Set(fsIds).size !== fsIds.length) {
-      return sendResponseHelper.errorResponse(res, {
-        statusCode: 400,
-        errorCode: "Invalid flightScheduleId (missing or duplicate)",
-      });
-    }
-
-    // ========== 3) owner ==========
+    // 3) owner: account hoặc guest
     const accountId = req.user?._id || null;
     const guestIdFromCookie = req.cookies?.guest_id;
     const guestId = accountId ? null : (guestIdFromCookie || buildGuestId());
 
-    // ========== 4) idempotency ==========
+    // 4) idempotency: trả session cũ nếu còn active
     if (idempotencyKey) {
       const existing = await BookingSession.findOne({
         idempotencyKey,
@@ -443,168 +584,154 @@ module.exports.create = async (req, res) => {
       }
     }
 
-    // ========== helpers ==========
-    const idStr = (x) => (x ? String(x) : null);
+    // 5) Resolve OUTBOUND
+    const outSeatClass = await loadSeatClass(outSeg.seatClassCode);
+    if (!outSeatClass) {
+      return sendResponseHelper.errorResponse(res, {
+        statusCode: 400,
+        errorCode: `Invalid seatClassCode: ${normalizeSeatClassCode(outSeg.seatClassCode)}`,
+      });
+    }
 
-    // server meta để validate round-trip
-    const segMeta = {};        // OUTBOUND/INBOUND -> { depAirportId, arrAirportId, depTime, arrTime }
-    const builtSegmentsMap = {};
+    const outFs = await loadScheduleWithFlight(outSeg.flightScheduleId);
+    if (!outFs) {
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Invalid OUTBOUND flightScheduleId" });
+    }
+
+    const outBookable = ensureScheduleBookable(outFs);
+    if (!outBookable.ok) {
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: outBookable.error });
+    }
+
+    const outFare = await loadFareSnapshot(outFs._id, outSeatClass._id);
+    if (!outFare) {
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "OUTBOUND fare not found" });
+    }
+
+    // 6) Resolve INBOUND (nếu round-trip)
+    let inSeatClass = null;
+    let inFs = null;
+    let inFare = null;
+
+    if (normalizedTripType === "ROUND_TRIP") {
+      inSeatClass = await loadSeatClass(inSeg.seatClassCode);
+      if (!inSeatClass) {
+        return sendResponseHelper.errorResponse(res, {
+          statusCode: 400,
+          errorCode: `Invalid seatClassCode: ${normalizeSeatClassCode(inSeg.seatClassCode)}`,
+        });
+      }
+
+      inFs = await loadScheduleWithFlight(inSeg.flightScheduleId);
+      if (!inFs) {
+        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Invalid INBOUND flightScheduleId" });
+      }
+
+      const inBookable = ensureScheduleBookable(inFs);
+      if (!inBookable.ok) {
+        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: inBookable.error });
+      }
+
+      // ✅ Nghiệp vụ quan trọng: INBOUND đảo chiều OUTBOUND + validate thời gian
+      const rt = validateRoundTripBusiness(outFs, inFs);
+      if (!rt.ok) {
+        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: rt.error, detail: rt.detail });
+      }
+
+      inFare = await loadFareSnapshot(inFs._id, inSeatClass._id);
+      if (!inFare) {
+        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "INBOUND fare not found" });
+      }
+    }
+
+    // 7) Build segments + snapshot giá
+    const builtSegments = [];
     let grand = { currency: "VND", adult: 0, child: 0, infant: 0, total: 0 };
 
-    // ========== 5) resolve each segment ==========
-    for (const dir of Object.keys(segByDir)) {
-      const seg = segByDir[dir];
+    const buildSegment = ({ direction, fs, seatClassDoc, fare }) => {
+      const basePrice = Number(fare.basePrice || 0);
+      const tax = Number(fare.tax || 0);
+      const serviceFee = Number(fare.serviceFee || 0);
 
-      const flightScheduleId = seg?.flightScheduleId;
-      const seatClassCodeRaw = seg?.seatClassCode;
+      const adultUnit = basePrice + tax + serviceFee;
 
-      if (!flightScheduleId || !seatClassCodeRaw) {
-        return sendResponseHelper.errorResponse(res, {
-          statusCode: 400,
-          errorCode: "Each segment requires flightScheduleId & seatClassCode",
-        });
-      }
-
-      const seatClassCode = String(seatClassCodeRaw).trim().toUpperCase();
-
-      // seatClass
-      const seatClassDoc = await SeatClass.findOne({
-        classCode: seatClassCode,
-        deleted: false,
-        status: "active",
-      }).lean();
-
-      if (!seatClassDoc) {
-        return sendResponseHelper.errorResponse(res, {
-          statusCode: 400,
-          errorCode: `Invalid seatClassCode: ${seatClassCode}`,
-        });
-      }
-
-      // flightSchedule + populate Flight (schema bạn gửi)
-      const fs = await FlightSchedule.findOne({
-        _id: flightScheduleId,
-        deleted: false,
-        status: "scheduled",
-      })
-        .populate({
-          path: "flightId",
-          select: "departureAirportId arrivalAirportId durationMinutes deleted status",
-        })
-        .lean();
-
-      if (!fs) {
-        return sendResponseHelper.errorResponse(res, {
-          statusCode: 400,
-          errorCode: `Invalid flightScheduleId: ${flightScheduleId}`,
-        });
-      }
-
-      const flight = fs.flightId;
-      if (!flight) {
-        return sendResponseHelper.errorResponse(res, {
-          statusCode: 500,
-          errorCode: "FlightSchedule missing flightId populate",
-        });
-      }
-
-      // NEW: flight must be active & not deleted
-      if (flight.deleted) {
-        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Flight is deleted" });
-      }
-      if (String(flight.status || "").toLowerCase() !== "active") {
-        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Flight is inactive" });
-      }
-
-      const depAirportId = idStr(flight.departureAirportId);
-      const arrAirportId = idStr(flight.arrivalAirportId);
-
-      if (!depAirportId || !arrAirportId) {
-        return sendResponseHelper.errorResponse(res, {
-          statusCode: 500,
-          errorCode: "Flight missing departureAirportId/arrivalAirportId",
-        });
-      }
-
-      // fare snapshot
-      const fare = await FlightFare.findOne({
-        flightScheduleId: fs._id,
-        seatClassId: seatClassDoc._id,
-        deleted: false,
-      }).select("basePrice tax serviceFee").lean();
-
-      if (!fare) {
-        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Fare not found" });
-      }
-
-      const adultUnit = Number(fare.basePrice || 0) + Number(fare.tax || 0) + Number(fare.serviceFee || 0);
+      // rule giá child/infant tuỳ nghiệp vụ (giữ như  đang làm)
       const childUnit = Math.round(adultUnit * 0.75);
       const infantUnit = Math.round(adultUnit * 0.1);
 
-      const segTotal = pax.adults * adultUnit + pax.children * childUnit + pax.infants * infantUnit;
+      const total = pax.adults * adultUnit + pax.children * childUnit + pax.infants * infantUnit;
 
       grand.adult += pax.adults * adultUnit;
       grand.child += pax.children * childUnit;
       grand.infant += pax.infants * infantUnit;
-      grand.total += segTotal;
+      grand.total += total;
 
-      builtSegmentsMap[dir] = {
-        direction: dir,
+      const flight = fs.flightId;
+
+      return {
+        direction,                     // OUTBOUND / INBOUND
         flightScheduleId: fs._id,
-        seatClassCode,
+        seatClassCode: seatClassDoc.classCode,
         seatClassId: seatClassDoc._id,
+
+        // seat selection
         seatAssignments: [],
-        seatTotalSnapshot: { currency: "VND", total: 0 },
+        seatTotalSnapshot: { currency: fare.currency || "VND", total: 0 },
+
+        // snapshot lịch bay (để sau này schedule/flight đổi vẫn giữ “audit”)
+        scheduleSnapshot: {
+          status: fs.status,
+          departureTime: fs.departureTime,
+          arrivalTime: fs.arrivalTime,
+          flightId: flight?._id,
+          flightNumber: flight?.flightNumber,
+          airlineId: flight?.airlineId,
+          fromAirportId: flight?.departureAirportId,
+          toAirportId: flight?.arrivalAirportId,
+          durationMinutes: flight?.durationMinutes,
+        },
+
+        // fare snapshot (base fare - chưa gồm seat fee)
+        fareSnapshot: {
+          currency: fare.currency || "VND",
+          basePrice,
+          tax,
+          serviceFee,
+        },
+
         priceSnapshot: {
-          currency: "VND",
+          currency: fare.currency || "VND",
           adult: adultUnit,
           child: childUnit,
           infant: infantUnit,
-          total: segTotal,
+          total,
         },
       };
+    };
 
-      segMeta[dir] = {
-        depAirportId,
-        arrAirportId,
-        depTime: fs.departureTime,
-        arrTime: fs.arrivalTime,
-      };
-    }
+    // OUTBOUND
+    builtSegments.push(
+      buildSegment({
+        direction: "OUTBOUND",
+        fs: outFs,
+        seatClassDoc: outSeatClass,
+        fare: outFare,
+      })
+    );
 
-    // ========== 5.5) round-trip business validation ==========
+    // INBOUND
     if (normalizedTripType === "ROUND_TRIP") {
-      const out = segMeta.OUTBOUND;
-      const inn = segMeta.INBOUND;
-
-      // (1) inbound must reverse outbound route
-      const reversed = out.depAirportId === inn.arrAirportId && out.arrAirportId === inn.depAirportId;
-      if (!reversed) {
-        return sendResponseHelper.errorResponse(res, {
-          statusCode: 400,
-          errorCode: "INBOUND route must be reverse of OUTBOUND",
-        });
-      }
-
-      // (2) inbound should depart after outbound arrives (recommended)
-      const outArr = new Date(out.arrTime).getTime();
-      const inDep = new Date(inn.depTime).getTime();
-
-      if (inDep < outArr) {
-        return sendResponseHelper.errorResponse(res, {
-          statusCode: 400,
-          errorCode: "INBOUND departureTime must be >= OUTBOUND arrivalTime",
-        });
-      }
+      builtSegments.push(
+        buildSegment({
+          direction: "INBOUND",
+          fs: inFs,
+          seatClassDoc: inSeatClass,
+          fare: inFare,
+        })
+      );
     }
 
-    // stable ordering: OUTBOUND then INBOUND
-    const builtSegments =
-      normalizedTripType === "ONE_WAY"
-        ? [builtSegmentsMap.OUTBOUND]
-        : [builtSegmentsMap.OUTBOUND, builtSegmentsMap.INBOUND];
-
-    // ========== 6) create session ==========
+    // 8) create session
     const now = new Date();
     const ttlMin = Number(process.env.BOOKING_SESSION_TTL_MINUTES || 15);
     const expiresAt = addMinutes(now, ttlMin);
@@ -618,6 +745,8 @@ module.exports.create = async (req, res) => {
       segments: builtSegments,
       passengersCount: pax,
       contactInfo: {},
+
+      // grand total: chỉ base fare (chưa gồm seat fee) -> đúng nghiệp vụ “tính lại khi chọn ghế”
       grandTotalSnapshot: {
         currency: grand.currency,
         adult: grand.adult,
@@ -634,10 +763,10 @@ module.exports.create = async (req, res) => {
       userAgent: req.headers["user-agent"],
     });
 
-    const rawSecret = session.generateAndSetSecret();
+    const rawSecret = session.generateAndSetSecret?.() || null;
     await session.save();
 
-    // cookies
+    // 9) cookies
     if (!accountId && !guestIdFromCookie) {
       res.cookie("guest_id", guestId, {
         httpOnly: true,
@@ -647,15 +776,23 @@ module.exports.create = async (req, res) => {
       });
     }
 
-    res.cookie("bs_token", rawSecret, {
-      httpOnly: true,
-      sameSite: "none",
-      secure: true,
-      maxAge: ttlMin * 60 * 1000,
-    });
+    if (rawSecret) {
+      res.cookie("bs_token", rawSecret, {
+        httpOnly: true,
+        sameSite: "none",
+        secure: true,
+        maxAge: ttlMin * 60 * 1000,
+      });
+    }
 
     return sendResponseHelper.successResponse(res, {
-      data: { publicId: session.publicId, status: session.status, expiresAt: session.expiresAt },
+      data: {
+        publicId: session.publicId,
+        status: session.status,
+        expiresAt: session.expiresAt,
+        tripType: session.tripType,
+        grandTotalSnapshot: session.grandTotalSnapshot,
+      },
     });
   } catch (error) {
     return sendResponseHelper.errorResponse(res, { errorCode: error.message });
