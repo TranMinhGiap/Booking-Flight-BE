@@ -150,12 +150,16 @@ module.exports.index = async (req, res) => {
      * baseCore: chỉ filter core (date/route/seatClass/pax/available) + tính fields
      * KHÔNG áp airline/price/duration ở đây
      */
+    const startD = new Date(start);
+    const endD = new Date(end);
+    const nowD = new Date();
+    const lowerBound = (nowD > startD && nowD < endD) ? nowD : startD;
     const baseCore = [
       {
         $match: {
           deleted: false,
-          status: "scheduled",
-          departureTime: { $gte: start, $lt: end },
+          status: { $in: ["scheduled", "delayed"] },
+          departureTime: { $gte: lowerBound, $lt: end },
         },
       },
 
