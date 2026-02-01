@@ -9,8 +9,79 @@ const FlightSchedule = require("../../models/flightSchedule.model");
 const Airport = require("../../models/airport.model");
 const SeatClass = require("../../models/seatClass.model");
 const Airline = require("../../models/airline.model");
+const Flight = require("../../models/flight.model");
 
 // [GET] /api/v1/flight-schedules/search
+
+// Version New (đảm bảo search > thời gian hiện tại, không quá sát giờ)
+// ==============================
+// CONFIG
+// ==============================
+const INCLUDE_EXPIRED_HELD_AS_AVAILABLE = true;
+
+// Optional: chặn đặt chuyến “sát giờ” (vd 10 phút)
+// nếu không muốn thì để 0
+const MIN_BOOKING_LEAD_MINUTES = Number(process.env.MIN_BOOKING_LEAD_MINUTES || 60);
+
+// turnaround phút tối thiểu giữa outbound arrival và inbound departure
+const MIN_TURNAROUND_MINUTES = Number(process.env.MIN_TURNAROUND_MINUTES || 60);
+
+// ==============================
+// HELPERS
+// ==============================
+function normalizeSeatClassCode(code) {
+  return String(code || "").trim().toUpperCase();
+}
+
+function normalizeIata(code) {
+  return String(code || "").trim().toUpperCase();
+}
+
+// dateStr có thể "YYYY-MM-DD" hoặc "DD/MM/YYYY"
+function normalizeInputDateToYMD(dateStr) {
+  const s = String(dateStr || "").trim();
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  const m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (m) {
+    const dd = m[1],
+      mm = m[2],
+      yyyy = m[3];
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  // fallback parse
+  const t = new Date(s);
+  if (!Number.isNaN(t.getTime())) {
+    const yyyy = t.getUTCFullYear();
+    const mm = String(t.getUTCMonth() + 1).padStart(2, "0");
+    const dd = String(t.getUTCDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  return null;
+}
+
+// YYYY-MM-DD theo timezone
+function ymdInTz(dateObj, timeZone) {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  return fmt.format(dateObj); // "2026-02-01"
+}
+
+function isSameObjectId(a, b) {
+  if (!a || !b) return false;
+  return String(a) === String(b);
+}
+
+// ==============================
+// CONTROLLER
+// ==============================
 module.exports.index = async (req, res) => {
   try {
     const {
@@ -22,7 +93,13 @@ module.exports.index = async (req, res) => {
       infants,
       seatClass,
 
-      // server-side filters
+      // CHẶT NHẤT: inbound sẽ gửi outboundScheduleId
+      outboundScheduleId,
+
+      // fallback (optional): FE có thể gửi minDepartAt, BE chỉ coi như fallback
+      minDepartAt,
+
+      // filters
       airlines, // "VN,VJ"
       minPrice,
       maxPrice,
@@ -33,18 +110,44 @@ module.exports.index = async (req, res) => {
       arrWindows,
     } = req.query;
 
+    const fromIata = normalizeIata(from);
+    const toIata = normalizeIata(to);
+
     const adultsN = Number(adults || 0);
     const childrenN = Number(children || 0);
     const infantsN = Number(infants || 0);
-    const pax = adultsN + childrenN; // cần ghế cho người lớn + trẻ em
+
+    // nghiệp vụ: cần ghế cho người lớn + trẻ em
+    const paxNeedSeat = adultsN + childrenN;
+
+    // validate cơ bản
+    if (!fromIata || !toIata || !date || !seatClass) {
+      return sendResponseHelper.errorResponse(res, {
+        statusCode: 400,
+        errorCode: "Missing required params: from, to, date, seatClass",
+      });
+    }
+    if (!Number.isFinite(adultsN) || adultsN < 1) {
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Invalid adults (must be >= 1)" });
+    }
+    if (!Number.isFinite(childrenN) || childrenN < 0) {
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Invalid children" });
+    }
+    if (!Number.isFinite(infantsN) || infantsN < 0) {
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Invalid infants" });
+    }
+    if (infantsN > adultsN) {
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Infants cannot exceed adults" });
+    }
 
     const sortSpec = buildSortSpec(sort);
 
     // 1) Validate airports
     const [fromAirport, toAirport] = await Promise.all([
-      Airport.findOne({ iataCode: from, deleted: false, status: "active" }).lean(),
-      Airport.findOne({ iataCode: to, deleted: false, status: "active" }).lean(),
+      Airport.findOne({ iataCode: fromIata, deleted: false, status: "active" }).lean(),
+      Airport.findOne({ iataCode: toIata, deleted: false, status: "active" }).lean(),
     ]);
+
     if (!fromAirport || !toAirport) {
       return sendResponseHelper.errorResponse(res, {
         statusCode: 400,
@@ -54,28 +157,109 @@ module.exports.index = async (req, res) => {
 
     // 2) Validate seatClass
     const seatClassDoc = await SeatClass.findOne({
-      classCode: seatClass,
+      classCode: normalizeSeatClassCode(seatClass),
       deleted: false,
       status: "active",
     }).lean();
+
     if (!seatClassDoc) {
-      return sendResponseHelper.errorResponse(res, {
-        statusCode: 400,
-        errorCode: "Invalid seatClass",
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Invalid seatClass" });
+    }
+
+    const tzFrom = fromAirport.timezone || "Asia/Ho_Chi_Minh";
+
+    // 3) Date range theo timezone sân bay đi (from)
+    // ⚠️ Bạn nên dùng helper dayRangeByTimezone của project bạn thay cho fallback ở trên
+    const { start, end } = dayRangeByTimezone(date, tzFrom);
+
+    // 4) Derived minDepartAt từ outboundScheduleId (CHẶT NHẤT)
+    let derivedMinDepartAt = null;
+
+    if (outboundScheduleId) {
+      const outFs = await FlightSchedule.findOne({
+        _id: outboundScheduleId,
+        deleted: false,
+        status: { $in: ["scheduled", "delayed"] },
+      }).lean();
+
+      if (!outFs) {
+        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Invalid outboundScheduleId" });
+      }
+
+      const outFlight = await Flight.findOne({
+        _id: outFs.flightId,
+        deleted: false,
+        status: "active",
+      }).lean();
+
+      if (!outFlight) {
+        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Outbound flight not found/inactive" });
+      }
+
+      // inbound request (fromAirport -> toAirport)
+      // outbound phải là chiều ngược lại: toAirport -> fromAirport
+      const reversedOk =
+        isSameObjectId(outFlight.departureAirportId, toAirport._id) &&
+        isSameObjectId(outFlight.arrivalAirportId, fromAirport._id);
+
+      if (!reversedOk) {
+        return sendResponseHelper.errorResponse(res, {
+          statusCode: 400,
+          errorCode: "outboundScheduleId is not reverse of requested route",
+        });
+      }
+
+      derivedMinDepartAt = new Date(outFs.arrivalTime.getTime() + MIN_TURNAROUND_MINUTES * 60 * 1000);
+    }
+
+    // 5) minDepartAt fallback (FE gửi) — BE chỉ coi như fallback
+    let minDepartAtDate = null;
+    if (minDepartAt) {
+      const t = new Date(minDepartAt);
+      if (!Number.isNaN(t.getTime())) {
+        minDepartAtDate = t;
+      } else {
+        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Invalid minDepartAt" });
+      }
+    }
+
+    // 6) depStart = max(start, derivedMinDepartAt, minDepartAtDate)
+    let depStart = start;
+
+    if (derivedMinDepartAt && derivedMinDepartAt > depStart) depStart = derivedMinDepartAt;
+    if (minDepartAtDate && minDepartAtDate > depStart) depStart = minDepartAtDate;
+
+    // 7) CHẶN “CHUYẾN ĐÃ BAY” KHI SEARCH HÔM NAY (theo tzFrom)
+    const now = new Date();
+    const qYmd = normalizeInputDateToYMD(date);
+    if (!qYmd) {
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "Invalid date format" });
+    }
+    const todayYmd = ymdInTz(now, tzFrom);
+    const isSearchingToday = qYmd === todayYmd;
+
+    if (isSearchingToday) {
+      const nowWithLead = new Date(now.getTime() + MIN_BOOKING_LEAD_MINUTES * 60 * 1000);
+      if (nowWithLead > depStart) depStart = nowWithLead;
+    }
+
+    // Nếu depStart >= end => ngày đó không còn chuyến nào hợp lệ
+    if (depStart >= end) {
+      const pagination = paginationHelper.objectPagination(req.query, 0);
+      return sendResponseHelper.successResponse(res, {
+        data: {
+          flights: [],
+          facets: {
+            priceRange: { min: 0, max: 0, currency: "VND" },
+            durationRange: { min: 0, max: 0 },
+            airlines: [],
+          },
+        },
+        pagination,
       });
     }
 
-    // 3) Date range theo timezone sân bay đi (from)
-    const { start, end } = dayRangeByTimezone(
-      date,
-      fromAirport.timezone || "Asia/Ho_Chi_Minh"
-    );
-
-    // OPTION: coi ghế held nhưng đã hết blockedUntil là available
-    const INCLUDE_EXPIRED_HELD_AS_AVAILABLE = true;
-    const now = new Date();
-
-    // 4) Parse filter params
+    // 8) Parse filters
     const minPriceN = Number(minPrice);
     const maxPriceN = Number(maxPrice);
     const minDurationN = Number(minDuration);
@@ -97,7 +281,7 @@ module.exports.index = async (req, res) => {
       .map((s) => s.trim().toUpperCase())
       .filter(Boolean);
 
-    // nếu có filter airlines bằng code -> convert sang airlineIds
+    // convert airlineCodes -> airlineIds
     let airlineIds = [];
     if (airlineCodes.length) {
       const found = await Airline.find({
@@ -110,7 +294,6 @@ module.exports.index = async (req, res) => {
 
       airlineIds = found.map((x) => x._id);
 
-      // user gửi airlineCodes nhưng không map ra id nào => 0 kết quả
       if (!airlineIds.length) {
         const pagination = paginationHelper.objectPagination(req.query, 0);
         return sendResponseHelper.successResponse(res, {
@@ -127,11 +310,9 @@ module.exports.index = async (req, res) => {
       }
     }
 
-    const matchAirlineFilter = airlineIds.length
-      ? { airlineId: { $in: airlineIds } }
-      : null;
+    const matchAirlineFilter = airlineIds.length ? { airlineId: { $in: airlineIds } } : null;
 
-    // ====== TÁCH FILTER: non-airline vs airline ======
+    // non-airline filters
     const andFilters = [];
 
     const priceQ = buildRange(minPriceN, maxPriceN);
@@ -140,26 +321,22 @@ module.exports.index = async (req, res) => {
     const durQ = buildRange(minDurationN, maxDurationN);
     if (durQ) andFilters.push({ durationMinutes: durQ });
 
-    // depWindows / arrWindows (lọc theo khung giờ)
     if (depOr.length) andFilters.push({ $or: depOr });
     if (arrOr.length) andFilters.push({ $or: arrOr });
 
     const matchNonAirlineFilters = andFilters.length ? { $and: andFilters } : {};
 
-    /**
-     * baseCore: chỉ filter core (date/route/seatClass/pax/available) + tính fields
-     * KHÔNG áp airline/price/duration ở đây
-     */
-    const startD = new Date(start);
-    const endD = new Date(end);
-    const nowD = new Date();
-    const lowerBound = (nowD > startD && nowD < endD) ? nowD : startD;
+    // ==============================
+    // AGG PIPELINE CORE
+    // ==============================
     const baseCore = [
       {
         $match: {
           deleted: false,
           status: { $in: ["scheduled", "delayed"] },
-          departureTime: { $gte: lowerBound, $lt: end },
+
+          // depStart đã gồm: start + inbound turnaround (derived/fallback) + today(now)
+          departureTime: { $gte: depStart, $lt: end },
         },
       },
 
@@ -206,7 +383,7 @@ module.exports.index = async (req, res) => {
       },
       { $match: { "fare.0": { $exists: true } } },
 
-      // đếm ghế available theo seatClass
+      // seat availability
       {
         $lookup: {
           from: "flight_seats",
@@ -220,17 +397,17 @@ module.exports.index = async (req, res) => {
                     { $eq: ["$deleted", false] },
                     INCLUDE_EXPIRED_HELD_AS_AVAILABLE
                       ? {
-                        $or: [
-                          { $eq: ["$status", "available"] },
-                          {
-                            $and: [
-                              { $eq: ["$status", "held"] },
-                              { $ne: ["$blockedUntil", null] },
-                              { $lt: ["$blockedUntil", now] },
-                            ],
-                          },
-                        ],
-                      }
+                          $or: [
+                            { $eq: ["$status", "available"] },
+                            {
+                              $and: [
+                                { $eq: ["$status", "held"] },
+                                { $ne: ["$blockedUntil", null] },
+                                { $lt: ["$blockedUntil", now] },
+                              ],
+                            },
+                          ],
+                        }
                       : { $eq: ["$status", "available"] },
                   ],
                 },
@@ -263,12 +440,10 @@ module.exports.index = async (req, res) => {
         },
       },
 
-      // tính availableCount + totalAdult + airlineId + flightNumber
+      // compute prices + fields
       {
         $addFields: {
-          availableCount: {
-            $ifNull: [{ $arrayElemAt: ["$seatStats.availableCount", 0] }, 0],
-          },
+          availableCount: { $ifNull: [{ $arrayElemAt: ["$seatStats.availableCount", 0] }, 0] },
           priceBreakdown: {
             base: { $arrayElemAt: ["$fare.basePrice", 0] },
             tax: { $arrayElemAt: ["$fare.tax", 0] },
@@ -278,104 +453,75 @@ module.exports.index = async (req, res) => {
       },
       {
         $addFields: {
-          totalAdult: {
-            $add: [
-              "$priceBreakdown.base",
-              "$priceBreakdown.tax",
-              "$priceBreakdown.serviceFee",
-            ],
-          },
+          totalAdult: { $add: ["$priceBreakdown.base", "$priceBreakdown.tax", "$priceBreakdown.serviceFee"] },
           airlineId: "$flight.airlineId",
           flightNumber: "$flight.flightNumber",
         },
       },
+
+      // minute-of-day for windows
       {
         $addFields: {
-          _depParts: {
-            $dateToParts: {
-              date: "$departureTime",
-              timezone: fromAirport.timezone || "Asia/Ho_Chi_Minh",
-            },
-          },
-          _arrParts: {
-            $dateToParts: {
-              date: "$arrivalTime",
-              timezone: toAirport.timezone || "Asia/Ho_Chi_Minh",
-            },
-          },
+          _depParts: { $dateToParts: { date: "$departureTime", timezone: tzFrom } },
+          _arrParts: { $dateToParts: { date: "$arrivalTime", timezone: toAirport.timezone || "Asia/Ho_Chi_Minh" } },
         },
       },
       {
         $addFields: {
-          depMinuteOfDay: {
-            $add: [{ $multiply: ["$_depParts.hour", 60] }, "$_depParts.minute"],
-          },
-          arrMinuteOfDay: {
-            $add: [{ $multiply: ["$_arrParts.hour", 60] }, "$_arrParts.minute"],
-          },
+          depMinuteOfDay: { $add: [{ $multiply: ["$_depParts.hour", 60] }, "$_depParts.minute"] },
+          arrMinuteOfDay: { $add: [{ $multiply: ["$_arrParts.hour", 60] }, "$_arrParts.minute"] },
         },
       },
 
-      // ───────────────────────────────────────────────────────────────
-      // TÍNH DURATION ĐỘNG TỪ departureTime và arrivalTime
-      {
-        $addFields: {
-          durationMs: {
-            $subtract: ["$arrivalTime", "$departureTime"],
-          },
-        },
-      },
+      // duration dynamic
+      { $addFields: { durationMs: { $subtract: ["$arrivalTime", "$departureTime"] } } },
       {
         $addFields: {
           durationMinutes: {
             $cond: {
               if: { $gte: ["$durationMs", 0] },
               then: { $round: [{ $divide: ["$durationMs", 60000] }] },
-              else: "$flight.durationMinutes", // fallback nếu dữ liệu lỗi
+              else: "$flight.durationMinutes",
             },
           },
         },
       },
 
-      // đủ ghế
-      { $match: { availableCount: { $gte: pax } } },
+      // đủ ghế (adult+child)
+      { $match: { availableCount: { $gte: paxNeedSeat } } },
     ];
 
-    // ====== totalRecord: áp full filter (non-airline + airline) ======
+    // ==============================
+    // COUNT
+    // ==============================
     const countPipeline = [
       ...baseCore,
       ...(Object.keys(matchNonAirlineFilters).length ? [{ $match: matchNonAirlineFilters }] : []),
       ...(matchAirlineFilter ? [{ $match: matchAirlineFilter }] : []),
       { $count: "totalRecord" },
     ];
+
     const countArr = await FlightSchedule.aggregate(countPipeline);
     const totalRecord = countArr?.[0]?.totalRecord || 0;
 
     const pagination = paginationHelper.objectPagination(req.query, totalRecord);
 
-    // ====== facetPipeline: airlinesFacet bỏ airline filter ======
+    // ==============================
+    // FACET
+    // ==============================
     const facetPipeline = [
       ...baseCore,
-      // áp non-airline filters cho TẤT CẢ nhánh (rows/facets/airlinesFacet)
       ...(Object.keys(matchNonAirlineFilters).length ? [{ $match: matchNonAirlineFilters }] : []),
 
       {
         $facet: {
-          // ROWS: áp airline filter
           rows: [
             ...(matchAirlineFilter ? [{ $match: matchAirlineFilter }] : []),
             { $sort: sortSpec },
             { $skip: pagination.skip },
             { $limit: pagination.limit },
 
-            {
-              $lookup: {
-                from: "airlines",
-                localField: "airlineId",
-                foreignField: "_id",
-                as: "airline",
-              },
-            },
+            { $lookup: { from: "airlines", localField: "airlineId", foreignField: "_id", as: "airline" } },
             { $unwind: "$airline" },
             { $match: { "airline.deleted": false, "airline.status": "active" } },
 
@@ -404,7 +550,7 @@ module.exports.index = async (req, res) => {
                   code: fromAirport.iataCode,
                   name: fromAirport.name,
                   city: fromAirport.city,
-                  timeZone: fromAirport.timezone || "Asia/Ho_Chi_Minh",
+                  timeZone: tzFrom,
                 },
                 to: {
                   code: toAirport.iataCode,
@@ -413,10 +559,7 @@ module.exports.index = async (req, res) => {
                   timeZone: toAirport.timezone || "Asia/Ho_Chi_Minh",
                 },
 
-                cabinClass: {
-                  code: seatClassDoc.classCode,
-                  name: seatClassDoc.className,
-                },
+                cabinClass: { code: seatClassDoc.classCode, name: seatClassDoc.className },
 
                 seatsAvailable: "$availableCount",
 
@@ -438,7 +581,6 @@ module.exports.index = async (req, res) => {
             },
           ],
 
-          // facets price/duration: theo kết quả đang lọc (có airline filter)
           facets: [
             ...(matchAirlineFilter ? [{ $match: matchAirlineFilter }] : []),
             {
@@ -459,7 +601,7 @@ module.exports.index = async (req, res) => {
             },
           ],
 
-          // airlinesFacet: KHÔNG matchAirlineFilter => luôn đủ option theo các filter khác
+          // airlinesFacet: bỏ airline filter => luôn đủ options
           airlinesFacet: [
             {
               $group: {
@@ -468,14 +610,7 @@ module.exports.index = async (req, res) => {
                 minPrice: { $min: "$totalAdult" },
               },
             },
-            {
-              $lookup: {
-                from: "airlines",
-                localField: "_id",
-                foreignField: "_id",
-                as: "airline",
-              },
-            },
+            { $lookup: { from: "airlines", localField: "_id", foreignField: "_id", as: "airline" } },
             { $unwind: "$airline" },
             { $match: { "airline.deleted": false, "airline.status": "active" } },
             {
@@ -507,13 +642,12 @@ module.exports.index = async (req, res) => {
     const facetArr = await FlightSchedule.aggregate(facetPipeline);
     const out = facetArr?.[0] || { rows: [], facets: {}, airlinesFacet: [] };
 
-    // fallback khi 0 record
     const safeFacets = out.facets?.priceRange
       ? out.facets
       : {
-        priceRange: { min: 0, max: 0, currency: "VND" },
-        durationRange: { min: 0, max: 0 },
-      };
+          priceRange: { min: 0, max: 0, currency: "VND" },
+          durationRange: { min: 0, max: 0 },
+        };
 
     return sendResponseHelper.successResponse(res, {
       data: {
@@ -527,7 +661,8 @@ module.exports.index = async (req, res) => {
     });
   } catch (error) {
     return sendResponseHelper.errorResponse(res, {
-      errorCode: error.message,
+      statusCode: 500,
+      errorCode: error?.message || "Internal error",
     });
   }
 };
