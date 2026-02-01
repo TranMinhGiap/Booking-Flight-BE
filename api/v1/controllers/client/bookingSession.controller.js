@@ -328,20 +328,19 @@ module.exports.index = async (req, res) => {
     return sendResponseHelper.errorResponse(res, { errorCode: error.message });
   }
 };
-// [POST] /api/v1/booking-sessions/create
-const ALLOWED_SCHEDULE_STATUS = new Set(["scheduled", "delayed"]); // tuỳ nghiệp vụ
-const MIN_TURNAROUND_MINUTES = Number(process.env.MIN_TURNAROUND_MINUTES || 0);
+// ==============================
+// CONFIG
+// ==============================
+const INCLUDE_EXPIRED_HELD_AS_AVAILABLE = true;
+const ALLOWED_SCHEDULE_STATUS = new Set(["scheduled", "delayed"]);
+const BOOKING_SESSION_TTL_MINUTES = Number(process.env.BOOKING_SESSION_TTL_MINUTES || 15);
+const MIN_TURNAROUND_MINUTES = Number(process.env.MIN_TURNAROUND_MINUTES || 60);
+// Chặn đặt sát giờ (để 0 là tắt)
+const MIN_BOOKING_LEAD_MINUTES = Number(process.env.MIN_BOOKING_LEAD_MINUTES || 0);
 
-function addMinutes(date, minutes) {
-  const d = new Date(date);
-  d.setMinutes(d.getMinutes() + Number(minutes || 0));
-  return d;
-}
-
-function buildGuestId() {
-  // tuỳ : uuid, nanoid...
-  return `guest_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-}
+// ==============================
+// HELPERS
+// ==============================
 
 function normalizeTripType(tripType) {
   return tripType === "ROUND_TRIP" ? "ROUND_TRIP" : "ONE_WAY";
@@ -359,21 +358,27 @@ function toIdStr(x) {
   return x ? String(x) : "";
 }
 
-function assertPax(pax) {
-  const adults = Number(pax?.adults ?? 1);
-  const children = Number(pax?.children ?? 0);
-  const infants = Number(pax?.infants ?? 0);
+function assertPax(passengersCount) {
+  const pax = {
+    adults: Number(passengersCount?.adults ?? 1),
+    children: Number(passengersCount?.children ?? 0),
+    infants: Number(passengersCount?.infants ?? 0),
+  };
 
-  if (!Number.isFinite(adults) || adults < 1) return { ok: false, error: "Invalid adults" };
-  if (!Number.isFinite(children) || children < 0) return { ok: false, error: "Invalid children" };
-  if (!Number.isFinite(infants) || infants < 0) return { ok: false, error: "Invalid infants" };
+  if (!Number.isFinite(pax.adults) || pax.adults < 1) return { ok: false, error: "Invalid adults" };
+  if (!Number.isFinite(pax.children) || pax.children < 0) return { ok: false, error: "Invalid children" };
+  if (!Number.isFinite(pax.infants) || pax.infants < 0) return { ok: false, error: "Invalid infants" };
+  if (pax.infants > pax.adults) return { ok: false, error: "Infants cannot exceed adults" };
 
-  // nghiệp vụ thường gặp: infants <= adults
-  if (infants > adults) return { ok: false, error: "Infants cannot exceed adults" };
-
-  return { ok: true, pax: { adults, children, infants } };
+  return { ok: true, pax };
 }
 
+/**
+ * Normalize segments và TRẢ VỀ KEY RÕ RÀNG: { out, in }
+ * - không phụ thuộc order FE
+ * - validate length theo tripType
+ * - validate direction
+ */
 function normalizeSegments(segments, tripType) {
   if (!Array.isArray(segments) || segments.length < 1 || segments.length > 2) {
     return { ok: false, error: "segments must be 1 or 2 items" };
@@ -381,71 +386,52 @@ function normalizeSegments(segments, tripType) {
 
   const t = normalizeTripType(tripType);
 
-  if (t === "ONE_WAY" && segments.length !== 1) {
-    return { ok: false, error: "ONE_WAY must have 1 segment" };
-  }
-  if (t === "ROUND_TRIP" && segments.length !== 2) {
-    return { ok: false, error: "ROUND_TRIP must have 2 segments" };
-  }
+  if (t === "ONE_WAY" && segments.length !== 1) return { ok: false, error: "ONE_WAY must have 1 segment" };
+  if (t === "ROUND_TRIP" && segments.length !== 2) return { ok: false, error: "ROUND_TRIP must have 2 segments" };
 
-  // map theo direction để không phụ thuộc order FE gửi lên
   const map = new Map();
   for (const seg of segments) {
     const dir = seg?.direction;
-    if (dir !== "OUTBOUND" && dir !== "INBOUND") {
-      return { ok: false, error: "direction must be OUTBOUND or INBOUND" };
-    }
-    if (map.has(dir)) {
-      return { ok: false, error: `Duplicate direction: ${dir}` };
-    }
+    if (dir !== "OUTBOUND" && dir !== "INBOUND") return { ok: false, error: "direction must be OUTBOUND or INBOUND" };
+    if (map.has(dir)) return { ok: false, error: `Duplicate direction: ${dir}` };
+    if (!seg?.flightScheduleId || !seg?.seatClassCode) return { ok: false, error: `${dir} requires flightScheduleId & seatClassCode` };
     map.set(dir, seg);
   }
 
   if (t === "ONE_WAY") {
     if (!map.has("OUTBOUND")) return { ok: false, error: "ONE_WAY direction must be OUTBOUND" };
   } else {
-    if (!map.has("OUTBOUND") || !map.has("INBOUND")) {
-      return { ok: false, error: "ROUND_TRIP must include OUTBOUND & INBOUND" };
-    }
+    if (!map.has("OUTBOUND") || !map.has("INBOUND")) return { ok: false, error: "ROUND_TRIP must include OUTBOUND & INBOUND" };
   }
 
   const out = map.get("OUTBOUND") || null;
   const inn = map.get("INBOUND") || null;
 
-  // kiểm tra field bắt buộc
-  const reqFields = (seg) => seg?.flightScheduleId && seg?.seatClassCode;
-  if (out && !reqFields(out)) return { ok: false, error: "OUTBOUND requires flightScheduleId & seatClassCode" };
-  if (inn && !reqFields(inn)) return { ok: false, error: "INBOUND requires flightScheduleId & seatClassCode" };
-
-  // tránh user gửi cùng 1 schedule cho cả 2 chặng
   if (out && inn && toIdStr(out.flightScheduleId) === toIdStr(inn.flightScheduleId)) {
     return { ok: false, error: "OUTBOUND and INBOUND cannot be the same flightScheduleId" };
   }
 
-  return { ok: true, tripType: t, out, inn };
+  return { ok: true, tripType: t, out, in: inn };
 }
 
 async function loadSeatClass(seatClassCode) {
   const code = normalizeSeatClassCode(seatClassCode);
   if (!code) return null;
 
-  const seatClassDoc = await SeatClass.findOne({
+  return SeatClass.findOne({
     classCode: code,
     deleted: false,
     status: "active",
   }).lean();
-
-  if (!seatClassDoc) return null;
-  return seatClassDoc;
 }
 
 /**
- * Load flightSchedule + populate flightId để có departureAirportId/arrivalAirportId
+ * Load schedule + populate flightId (route info)
  */
 async function loadScheduleWithFlight(flightScheduleId) {
   if (!isValidObjectId(flightScheduleId)) return null;
 
-  const fs = await FlightSchedule.findOne({
+  return FlightSchedule.findOne({
     _id: flightScheduleId,
     deleted: false,
   })
@@ -454,40 +440,80 @@ async function loadScheduleWithFlight(flightScheduleId) {
       select: "departureAirportId arrivalAirportId airlineId flightNumber status deleted durationMinutes",
     })
     .lean();
-
-  if (!fs) return null;
-  return fs;
 }
 
 async function loadFareSnapshot(flightScheduleId, seatClassId) {
-  const fare = await FlightFare.findOne({
+  return FlightFare.findOne({
     flightScheduleId,
     seatClassId,
     deleted: false,
   })
     .select("basePrice tax serviceFee currency")
     .lean();
+}
 
-  if (!fare) return null;
-  return fare;
+/**
+ * Count ghế available cho seatClass, coi held hết hạn là available (config)
+ */
+async function countAvailableSeats({ flightScheduleId, airplaneId, seatClassId }) {
+  const now = new Date();
+
+  const agg = await FlightSeat.aggregate([
+    {
+      $match: {
+        flightScheduleId,
+        deleted: false,
+        ...(INCLUDE_EXPIRED_HELD_AS_AVAILABLE
+          ? {
+              $or: [
+                { status: "available" },
+                { status: "held", blockedUntil: { $ne: null, $lt: now } },
+              ],
+            }
+          : { status: "available" }),
+      },
+    },
+    {
+      $lookup: {
+        from: "seat_layouts",
+        localField: "seatLayoutId",
+        foreignField: "_id",
+        as: "layout",
+      },
+    },
+    { $unwind: "$layout" },
+    {
+      $match: {
+        "layout.deleted": false,
+        "layout.status": "active",
+        "layout.airplaneId": airplaneId,
+        "layout.seatClassId": seatClassId,
+      },
+    },
+    { $count: "availableCount" },
+  ]);
+
+  return agg?.[0]?.availableCount || 0;
 }
 
 function ensureScheduleBookable(fs) {
   if (!fs) return { ok: false, error: "Invalid flightScheduleId" };
-
   if (fs.deleted) return { ok: false, error: "FlightSchedule deleted" };
 
   if (!ALLOWED_SCHEDULE_STATUS.has(fs.status)) {
     return { ok: false, error: `FlightSchedule status not bookable: ${fs.status}` };
   }
 
-  // nghiệp vụ: không cho đặt nếu đã bay
-  const now = Date.now();
-  const dep = fs.departureTime ? new Date(fs.departureTime).getTime() : null;
-  if (!dep || !Number.isFinite(dep)) return { ok: false, error: "Invalid departureTime" };
-  if (dep <= now) return { ok: false, error: "FlightSchedule already departed" };
+  const depMs = fs.departureTime ? new Date(fs.departureTime).getTime() : NaN;
+  if (!Number.isFinite(depMs)) return { ok: false, error: "Invalid departureTime" };
 
-  // flight must exist & active
+  const nowMs = Date.now();
+  const leadMs = MIN_BOOKING_LEAD_MINUTES * 60 * 1000;
+
+  if (depMs <= nowMs + leadMs) {
+    return { ok: false, error: "FlightSchedule is too close or already departed" };
+  }
+
   const fl = fs.flightId;
   if (!fl) return { ok: false, error: "Flight not found for schedule" };
   if (fl.deleted) return { ok: false, error: "Flight deleted" };
@@ -497,13 +523,11 @@ function ensureScheduleBookable(fs) {
 }
 
 function validateRoundTripBusiness(outFs, inFs) {
-  // bắt buộc inbound đảo chiều outbound
   const outFlight = outFs?.flightId;
   const inFlight = inFs?.flightId;
 
   const outDep = toIdStr(outFlight?.departureAirportId);
   const outArr = toIdStr(outFlight?.arrivalAirportId);
-
   const inDep = toIdStr(inFlight?.departureAirportId);
   const inArr = toIdStr(inFlight?.arrivalAirportId);
 
@@ -511,7 +535,6 @@ function validateRoundTripBusiness(outFs, inFs) {
     return { ok: false, error: "Missing flight route info" };
   }
 
-  // inbound phải là reverse route của outbound
   if (!(inDep === outArr && inArr === outDep)) {
     return {
       ok: false,
@@ -523,22 +546,20 @@ function validateRoundTripBusiness(outFs, inFs) {
     };
   }
 
-  // inbound phải bay sau outbound đến + turnaround
   const outArrTime = new Date(outFs.arrivalTime).getTime();
   const inDepTime = new Date(inFs.departureTime).getTime();
-
   const minInDep = outArrTime + MIN_TURNAROUND_MINUTES * 60 * 1000;
+
   if (inDepTime < minInDep) {
-    return {
-      ok: false,
-      error: `INBOUND departure must be after OUTBOUND arrival (+${MIN_TURNAROUND_MINUTES}m)`,
-    };
+    return { ok: false, error: `INBOUND departure must be after OUTBOUND arrival (+${MIN_TURNAROUND_MINUTES}m)` };
   }
 
   return { ok: true };
 }
 
+// ==============================
 // [POST] /api/v1/booking-sessions/create
+// ==============================
 module.exports.create = async (req, res) => {
   try {
     const { tripType = "ONE_WAY", segments = [], passengersCount, idempotencyKey } = req.body || {};
@@ -549,22 +570,26 @@ module.exports.create = async (req, res) => {
       return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: paxResult.error });
     }
     const pax = paxResult.pax;
+    const requiredSeats = pax.adults + pax.children;
 
-    // 2) segments normalize (không phụ thuộc order FE)
+    // 2) segments normalize
     const segResult = normalizeSegments(segments, tripType);
     if (!segResult.ok) {
       return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: segResult.error });
     }
+
     const normalizedTripType = segResult.tripType;
     const outSeg = segResult.out;
     const inSeg = segResult.in;
 
-    // 3) owner: account hoặc guest
+    // 3) owner
     const accountId = req.user?._id || null;
     const guestIdFromCookie = req.cookies?.guest_id;
+
+    // bạn thay hàm buildGuestId theo project bạn
     const guestId = accountId ? null : (guestIdFromCookie || buildGuestId());
 
-    // 4) idempotency: trả session cũ nếu còn active
+    // 4) idempotency
     if (idempotencyKey) {
       const existing = await BookingSession.findOne({
         idempotencyKey,
@@ -579,18 +604,17 @@ module.exports.create = async (req, res) => {
             publicId: existing.publicId,
             status: existing.status,
             expiresAt: existing.expiresAt,
+            tripType: existing.tripType,
+            grandTotalSnapshot: existing.grandTotalSnapshot,
           },
         });
       }
     }
 
-    // 5) Resolve OUTBOUND
+    // ===== Resolve OUTBOUND =====
     const outSeatClass = await loadSeatClass(outSeg.seatClassCode);
     if (!outSeatClass) {
-      return sendResponseHelper.errorResponse(res, {
-        statusCode: 400,
-        errorCode: `Invalid seatClassCode: ${normalizeSeatClassCode(outSeg.seatClassCode)}`,
-      });
+      return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: `Invalid seatClassCode: ${normalizeSeatClassCode(outSeg.seatClassCode)}` });
     }
 
     const outFs = await loadScheduleWithFlight(outSeg.flightScheduleId);
@@ -608,7 +632,20 @@ module.exports.create = async (req, res) => {
       return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "OUTBOUND fare not found" });
     }
 
-    // 6) Resolve INBOUND (nếu round-trip)
+    // check seats outbound
+    const outAvail = await countAvailableSeats({
+      flightScheduleId: outFs._id,
+      airplaneId: outFs.airplaneId,
+      seatClassId: outSeatClass._id,
+    });
+    if (outAvail < requiredSeats) {
+      return sendResponseHelper.errorResponse(res, {
+        statusCode: 409,
+        errorCode: `Not enough seats for OUTBOUND. Required=${requiredSeats}, Available=${outAvail}`,
+      });
+    }
+
+    // ===== Resolve INBOUND (if round-trip) =====
     let inSeatClass = null;
     let inFs = null;
     let inFare = null;
@@ -616,10 +653,7 @@ module.exports.create = async (req, res) => {
     if (normalizedTripType === "ROUND_TRIP") {
       inSeatClass = await loadSeatClass(inSeg.seatClassCode);
       if (!inSeatClass) {
-        return sendResponseHelper.errorResponse(res, {
-          statusCode: 400,
-          errorCode: `Invalid seatClassCode: ${normalizeSeatClassCode(inSeg.seatClassCode)}`,
-        });
+        return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: `Invalid seatClassCode: ${normalizeSeatClassCode(inSeg.seatClassCode)}` });
       }
 
       inFs = await loadScheduleWithFlight(inSeg.flightScheduleId);
@@ -632,7 +666,6 @@ module.exports.create = async (req, res) => {
         return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: inBookable.error });
       }
 
-      // ✅ Nghiệp vụ quan trọng: INBOUND đảo chiều OUTBOUND + validate thời gian
       const rt = validateRoundTripBusiness(outFs, inFs);
       if (!rt.ok) {
         return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: rt.error, detail: rt.detail });
@@ -642,11 +675,23 @@ module.exports.create = async (req, res) => {
       if (!inFare) {
         return sendResponseHelper.errorResponse(res, { statusCode: 400, errorCode: "INBOUND fare not found" });
       }
+
+      const inAvail = await countAvailableSeats({
+        flightScheduleId: inFs._id,
+        airplaneId: inFs.airplaneId,
+        seatClassId: inSeatClass._id,
+      });
+      if (inAvail < requiredSeats) {
+        return sendResponseHelper.errorResponse(res, {
+          statusCode: 409,
+          errorCode: `Not enough seats for INBOUND. Required=${requiredSeats}, Available=${inAvail}`,
+        });
+      }
     }
 
-    // 7) Build segments + snapshot giá
+    // 5) Build segments + grandTotalSnapshot
     const builtSegments = [];
-    let grand = { currency: "VND", adult: 0, child: 0, infant: 0, total: 0 };
+    const grand = { currency: "VND", adult: 0, child: 0, infant: 0, total: 0 };
 
     const buildSegment = ({ direction, fs, seatClassDoc, fare }) => {
       const basePrice = Number(fare.basePrice || 0);
@@ -654,44 +699,44 @@ module.exports.create = async (req, res) => {
       const serviceFee = Number(fare.serviceFee || 0);
 
       const adultUnit = basePrice + tax + serviceFee;
-
-      // rule giá child/infant tuỳ nghiệp vụ (giữ như  đang làm)
       const childUnit = Math.round(adultUnit * 0.75);
       const infantUnit = Math.round(adultUnit * 0.1);
 
-      const total = pax.adults * adultUnit + pax.children * childUnit + pax.infants * infantUnit;
+      const total =
+        pax.adults * adultUnit +
+        pax.children * childUnit +
+        pax.infants * infantUnit;
 
       grand.adult += pax.adults * adultUnit;
       grand.child += pax.children * childUnit;
       grand.infant += pax.infants * infantUnit;
       grand.total += total;
 
-      const flight = fs.flightId;
+      const fl = fs.flightId;
 
       return {
-        direction,                     // OUTBOUND / INBOUND
+        direction,
         flightScheduleId: fs._id,
         seatClassCode: seatClassDoc.classCode,
         seatClassId: seatClassDoc._id,
 
-        // seat selection
+        // seat selection state
         seatAssignments: [],
         seatTotalSnapshot: { currency: fare.currency || "VND", total: 0 },
 
-        // snapshot lịch bay (để sau này schedule/flight đổi vẫn giữ “audit”)
+        // snapshots for audit
         scheduleSnapshot: {
           status: fs.status,
           departureTime: fs.departureTime,
           arrivalTime: fs.arrivalTime,
-          flightId: flight?._id,
-          flightNumber: flight?.flightNumber,
-          airlineId: flight?.airlineId,
-          fromAirportId: flight?.departureAirportId,
-          toAirportId: flight?.arrivalAirportId,
-          durationMinutes: flight?.durationMinutes,
+          flightId: fl?._id,
+          flightNumber: fl?.flightNumber,
+          airlineId: fl?.airlineId,
+          fromAirportId: fl?.departureAirportId,
+          toAirportId: fl?.arrivalAirportId,
+          durationMinutes: fl?.durationMinutes,
         },
 
-        // fare snapshot (base fare - chưa gồm seat fee)
         fareSnapshot: {
           currency: fare.currency || "VND",
           basePrice,
@@ -709,32 +754,15 @@ module.exports.create = async (req, res) => {
       };
     };
 
-    // OUTBOUND
-    builtSegments.push(
-      buildSegment({
-        direction: "OUTBOUND",
-        fs: outFs,
-        seatClassDoc: outSeatClass,
-        fare: outFare,
-      })
-    );
+    builtSegments.push(buildSegment({ direction: "OUTBOUND", fs: outFs, seatClassDoc: outSeatClass, fare: outFare }));
 
-    // INBOUND
     if (normalizedTripType === "ROUND_TRIP") {
-      builtSegments.push(
-        buildSegment({
-          direction: "INBOUND",
-          fs: inFs,
-          seatClassDoc: inSeatClass,
-          fare: inFare,
-        })
-      );
+      builtSegments.push(buildSegment({ direction: "INBOUND", fs: inFs, seatClassDoc: inSeatClass, fare: inFare }));
     }
 
-    // 8) create session
+    // 6) Create session
     const now = new Date();
-    const ttlMin = Number(process.env.BOOKING_SESSION_TTL_MINUTES || 15);
-    const expiresAt = addMinutes(now, ttlMin);
+    const expiresAt = addMinutes(now, BOOKING_SESSION_TTL_MINUTES);
 
     const session = new BookingSession({
       ownerType: accountId ? "ACCOUNT" : "GUEST",
@@ -746,7 +774,7 @@ module.exports.create = async (req, res) => {
       passengersCount: pax,
       contactInfo: {},
 
-      // grand total: chỉ base fare (chưa gồm seat fee) -> đúng nghiệp vụ “tính lại khi chọn ghế”
+      // base fare only (seat fee tính sau)
       grandTotalSnapshot: {
         currency: grand.currency,
         adult: grand.adult,
@@ -766,12 +794,12 @@ module.exports.create = async (req, res) => {
     const rawSecret = session.generateAndSetSecret?.() || null;
     await session.save();
 
-    // 9) cookies
+    // 7) cookies (local dev: sameSite none + secure sẽ KHÔNG set nếu http)
     if (!accountId && !guestIdFromCookie) {
       res.cookie("guest_id", guestId, {
         httpOnly: true,
-        sameSite: "none",
-        secure: true,
+        sameSite: "lax",
+        secure: false,
         maxAge: 30 * 24 * 60 * 60 * 1000,
       });
     }
@@ -779,9 +807,9 @@ module.exports.create = async (req, res) => {
     if (rawSecret) {
       res.cookie("bs_token", rawSecret, {
         httpOnly: true,
-        sameSite: "none",
-        secure: true,
-        maxAge: ttlMin * 60 * 1000,
+        sameSite: "lax",
+        secure: false,
+        maxAge: BOOKING_SESSION_TTL_MINUTES * 60 * 1000,
       });
     }
 
@@ -795,9 +823,15 @@ module.exports.create = async (req, res) => {
       },
     });
   } catch (error) {
-    return sendResponseHelper.errorResponse(res, { errorCode: error.message });
+    console.error("create booking session error:", error);
+    return sendResponseHelper.errorResponse(res, {
+      statusCode: error?._http || 500,
+      errorCode: error?.message || "Internal error",
+      detail: error?.detail,
+    });
   }
 };
+
 // [PATCH] /api/v1/booking-sessions/:publicId/seat-assignments
 module.exports.patchSeatAssignments = async (req, res) => {
   function assertValidDirection(direction) {
