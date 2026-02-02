@@ -1,43 +1,39 @@
-const express = require('express')
-const app = express()
+const express = require("express");
+const cookieParser = require("cookie-parser");
 
-// ==== Config common necessary ====
-require('dotenv').config()    // env config => load biến môi trường từ file .env
+require("dotenv").config();
 
-const database = require('./config/database')  // database config
+const database = require("./config/database");
+const corsConfig = require("./config/cors");
 
-const corsConfig = require('./config/cors')  // cors config
+const routesApiV1Client = require("./api/v1/routes/client/index.route");
+const routesApiV1Admin = require("./api/v1/routes/admin/index.route");
 
-const cookieParser = require('cookie-parser')   // cookie parser config
+const app = express();
 
-const port = process.env.PORT  // port config => lấy biến môi trường PORT từ file .env
-// ==== End config common necessary ====
+// Middleware
+app.use(express.json());
+app.use(cookieParser());
+app.use(corsConfig);
+app.options(/.*/, corsConfig);
 
-// ==== Middleware common necessary ====
-app.use(express.json())   // Đọc dữ liệu từ req.body khi dùng API
-app.use(cookieParser())   // Thao tác với cookie
-app.use(corsConfig)       // Cors
-app.options(/.*/, corsConfig); // xử lý preflight cho toàn bộ route
-// ==== End Middleware common necessary ====
-
-// ==== Routes api ====
-const routesApiV1Client = require('./api/v1/routes/client/index.route')
-const routesApiV1Admin = require('./api/v1/routes/admin/index.route')
-// ==== End routes api ====
-
-// ==== Subscribe/Start routes ====
-routesApiV1Client(app);
-routesApiV1Admin(app);
-// ==== End subscribe/start routes ====
-
-// ==== Connect to the database ====
-(async () => {
+// Connect DB trước routes
+let isDbConnected = false;
+app.use(async (req, res, next) => {
   try {
-    await database.connect();
-    app.listen(port, () => console.log(`Listening on port ${port}`));
+    if (!isDbConnected) {
+      await database.connect();
+      isDbConnected = true;
+    }
+    next();
   } catch (err) {
     console.error("DB connect failed:", err);
-    process.exit(1);
+    res.status(500).json({ message: "Database connection failed" });
   }
-})();
-// ==== End connect to the database ====
+});
+
+// Routes
+routesApiV1Client(app);
+routesApiV1Admin(app);
+
+module.exports = app;
